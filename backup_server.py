@@ -665,45 +665,98 @@ def get_moodle_version(server_name):
     release = release_match.group(1) if release_match else None
     return branch, release
 
-def update_moodle_code(server_name, method='git-pull', verbose=False):
+def get_current_branch(web_root):
+    """Return the currently checked-out branch, or None."""
+    result = subprocess.run(
+        ['git', '-C', web_root, 'rev-parse', '--abbrev-ref', 'HEAD'],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return None
+    branch = result.stdout.strip()
+    return None if branch in ('', 'HEAD') else branch
+
+def is_shallow_clone(web_root):
+    return os.path.exists(os.path.join(web_root, '.git', 'shallow'))
+
+def update_moodle_code(server_name, branch=None, verbose=False):
+    """
+    Update Moodle code from git.
+
+    - Shallow clone  -> depth-1 fetch + reset --hard FETCH_HEAD (stays shallow, tiny download)
+    - Full clone     -> git pull --ff-only
+    Untracked files (config.php, local/, plugins, moodledata) are preserved by git itself.
+    Modified *tracked* files will be lost – we warn about that.
+    """
     web_root = get_moodle_root(server_name)
     if not os.path.isdir(os.path.join(web_root, '.git')):
         print_error(f"{web_root} is not a git repository.")
         sys.exit(1)
 
-    if method == 'git-pull':
-        # Check if shallow
-        is_shallow = os.path.exists(os.path.join(web_root, '.git', 'shallow'))
-        if is_shallow:
-            print_info("Shallow clone detected. Unshallowing...")
-            run_cmd(['git', '-C', web_root, 'fetch', '--unshallow'], verbose)
-        # Now pull (preserves untracked files)
-        run_cmd(['git', '-C', web_root, 'pull', '--ff-only'], verbose)
+    current_branch = branch or get_current_branch(web_root)
+    if not current_branch:
+        print_warning(f"Could not determine current branch in {web_root}.")
+        current_branch = 'MOODLE_502_STABLE'
+        print_info(f"Falling back to branch: {current_branch}")
 
-    elif method == 'git-fetch-reset':
-        # This is dangerous – only use if you're SURE you want to wipe local changes
-        print_warning("This will remove any untracked files (plugins may be lost!).")
-        if not print_prompt("Continue? (y/N): ").lower().startswith('y'):
-            return
-        run_cmd(['git', '-C', web_root, 'fetch', '--depth=1', 'origin', 'MOODLE_502_STABLE'], verbose)
-        run_cmd(['git', '-C', web_root, 'reset', '--hard', 'origin/MOODLE_502_STABLE'], verbose)
+    print_info(f"Updating {server_name} at {web_root} (branch: {current_branch})")
 
-    elif method == 'tarball':
-        # Using tarball is safe because it overwrites only core files – plugins remain
-        url = 'https://github.com/moodle/moodle/archive/MOODLE_502_STABLE.tar.gz'
-        import tempfile, urllib.request
-        with tempfile.NamedTemporaryFile(suffix='.tar.gz') as tmp:
-            print_info(f"Downloading {url}...")
-            urllib.request.urlretrieve(url, tmp.name)
-            print_info("Extracting...")
-            run_cmd(['tar', '-xzf', tmp.name, '-C', os.path.dirname(web_root),
-                     '--strip-components=1', '--skip-old-files'], verbose)
-            # `--skip-old-files` prevents overwriting existing plugin files
-        # Alternatively, use `--overwrite` for core files, but that's riskier
+    # Warn about modified tracked files that will be lost
+    status = subprocess.run(
+        ['git', '-C', web_root, 'status', '--porcelain'],
+        capture_output=True, text=True
+    ).stdout
+    modified = [l for l in status.splitlines() if l[:2].strip() and not l.startswith('??')]
+    if modified:
+        print_warning(f"{len(modified)} tracked file(s) have local modifications. "
+                      "These will be overwritten by the update:")
+        for line in modified[:10]:
+            print(f"    {line}")
+        if len(modified) > 10:
+            print(f"    ... and {len(modified) - 10} more")
+        if not print_prompt("Continue and discard these changes? (y/N): ").lower().startswith('y'):
+            print_warning("Update aborted by user.")
+            sys.exit(0)
 
+    # Record current HEAD
+    before = subprocess.run(
+        ['git', '-C', web_root, 'rev-parse', '--short', 'HEAD'],
+        capture_output=True, text=True
+    ).stdout.strip()
+
+    shallow = is_shallow_clone(web_root)
+
+    if shallow:
+        print_info("Shallow clone detected – using depth-1 fetch + reset (stays shallow).")
+        run_cmd(['git', '-C', web_root, 'fetch', '--depth', '1',
+                 'origin', current_branch], verbose)
+        run_cmd(['git', '-C', web_root, 'reset', '--hard', 'FETCH_HEAD'], verbose)
     else:
-        print_error(f"Unknown method: {method}")
-        sys.exit(1)
+        print_info("Full clone detected – using fast-forward pull.")
+        result = subprocess.run(
+            ['git', '-C', web_root, 'pull', '--ff-only', 'origin', current_branch],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print_warning(f"Fast-forward pull failed: {result.stderr.strip()}")
+            print_info("Falling back to depth-1 fetch + reset.")
+            run_cmd(['git', '-C', web_root, 'fetch', '--depth', '1',
+                     'origin', current_branch], verbose)
+            run_cmd(['git', '-C', web_root, 'reset', '--hard', 'FETCH_HEAD'], verbose)
+        elif verbose and result.stdout:
+            print(result.stdout)
+
+    after = subprocess.run(
+        ['git', '-C', web_root, 'rev-parse', '--short', 'HEAD'],
+        capture_output=True, text=True
+    ).stdout.strip()
+
+    if before == after:
+        print_success(f"No new changes – {server_name} already up to date ({after}).")
+        return False
+
+    print_success(f"Updated {server_name}: {before} -> {after}")
+    return True
 
 def upgrade_moodle(server_name, check_only=False, verbose=False):
     """
@@ -715,6 +768,55 @@ def upgrade_moodle(server_name, check_only=False, verbose=False):
         args.append('--check')
     result = run_moodle_cli(server_name, 'upgrade.php', args, verbose)
     return result.returncode
+
+def update_moodle(server_name, branch=None, enable_maintenance=True, verbose=False):
+    """
+    Full Moodle update flow:
+      1. Enable maintenance mode (optional)
+      2. Update code via git (shallow-aware)
+      3. Run PHP DB upgrade if code changed
+      4. Purge caches
+      5. Disable maintenance mode (always, in finally)
+    """
+    web_root = get_moodle_root(server_name)
+    if not os.path.isdir(web_root):
+        print_error(f"Web root {web_root} not found for {server_name}")
+        sys.exit(1)
+
+    if enable_maintenance:
+        print_info("Enabling maintenance mode...")
+        try:
+            set_maintenance(server_name, enable=True, verbose=verbose)
+        except SystemExit:
+            print_warning("Could not enable maintenance mode; continuing anyway.")
+
+    try:
+        # 1. Code update
+        changed = update_moodle_code(server_name, branch=branch, verbose=verbose)
+
+        # 2. Database upgrade (only needed when code actually changed)
+        if changed:
+            print_info("Running Moodle database upgrade...")
+            rc = upgrade_moodle(server_name, check_only=False, verbose=verbose)
+            if rc != 0:
+                print_error(f"Moodle upgrade returned exit code {rc}. "
+                            "Check the logs – maintenance mode will still be disabled.")
+        else:
+            print_info("No code changes; skipping database upgrade.")
+
+        # 3. Purge caches (always – harmless and a good idea)
+        print_info("Purging caches...")
+        run_moodle_cli(server_name, 'purge_caches.php', verbose=verbose)
+
+    finally:
+        if enable_maintenance:
+            print_info("Disabling maintenance mode...")
+            try:
+                set_maintenance(server_name, enable=False, verbose=verbose)
+            except SystemExit:
+                print_warning("Could not disable maintenance mode. Disable it manually!")
+
+    print_success(f"Update of {server_name} complete.")
 
 def set_maintenance(server_name, enable=True, verbose=False):
     mode = '--enable' if enable else '--disable'
@@ -1754,6 +1856,21 @@ def main():
     restore_parser.add_argument('--maintenance', action='store_true',
                             help='Enable maintenance mode before restore and disable afterwards')
 
+    # --- NEW: update parser (git + php upgrade) ---
+    update_parser = subparsers.add_parser(
+        'update',
+        help='Update Moodle code from git (shallow-aware) and run the DB upgrade'
+    )
+    update_parser.add_argument('--server', choices=SERVERS.keys(),
+                               default=PRIMARY_SERVER,
+                               help='Which server to update (default: primary)')
+    update_parser.add_argument('--branch',
+                               help='Git branch to update from (default: currently checked-out branch)')
+    update_parser.add_argument('--no-maintenance', action='store_true',
+                               help='Do not toggle maintenance mode during the update')
+    update_parser.add_argument('-v', '--verbose', action='store_true',
+                               help='Print detailed progress')
+
     args = parser.parse_args()
     if args.verbose:
         global _USE_COLOR
@@ -1799,6 +1916,14 @@ def main():
             run_cron(args.server, args.verbose)
     elif args.command == 'status':
         show_status(args.server, args.verbose)
+
+    elif args.command == 'update':
+        update_moodle(
+            args.server,
+            branch=args.branch,
+            enable_maintenance=not args.no_maintenance,
+            verbose=args.verbose,
+        )
     else:
         parser.print_help()
         sys.exit(1)
