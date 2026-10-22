@@ -100,13 +100,13 @@ DEFAULT_CONFIG = {
             "config_file": "/var/www/html/example-a-Server/config.php",
             "symlink_name": "example-a",
             "symlink_target": "example-a-Server/public",
-            "backup_web_root": true
+            "backup_web_root": True
         },
         "example-b": {
             "config_file": "/var/www/html/example-b-Server/config.php",
             "symlink_name": "example-b",
             "symlink_target": "example-b-Server/public",
-            "backup_web_root": false,
+            "backup_web_root": False,
             "clone_web_root_from": "example-a"
         }
     }
