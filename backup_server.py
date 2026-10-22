@@ -85,6 +85,8 @@ PHP_BIN = 'php'
 # ----------------------------------------------------------------------
 CONFIG_FILE_NAME = '.moodle_ninja_config.json'
 
+# Bare defaults — merged into every user config on load. Must NOT contain
+# servers, otherwise placeholders leak into real configs on every run.
 DEFAULT_CONFIG = {
     "version": 2,
     "php_bin": "php",
@@ -95,20 +97,24 @@ DEFAULT_CONFIG = {
         "temp", "cache", "sessions", "localcache", "repository",
         "theme", "environment", "filter", "calendar", "muc", "lang", "rss", "search"
     ],
-    "servers": {
-        "example-a": {
-            "config_file": "/var/www/html/example-a-Server/config.php",
-            "symlink_name": "example-a",
-            "symlink_target": "example-a-Server/public",
-            "backup_web_root": True
-        },
-        "example-b": {
-            "config_file": "/var/www/html/example-b-Server/config.php",
-            "symlink_name": "example-b",
-            "symlink_target": "example-b-Server/public",
-            "backup_web_root": False,
-            "clone_web_root_from": "example-a"
-        }
+    "servers": {}
+}
+
+# First-run template only. Written to disk once, then never re-merged.
+FIRST_RUN_TEMPLATE = json.loads(json.dumps(DEFAULT_CONFIG))
+FIRST_RUN_TEMPLATE["servers"] = {
+    "example-a": {
+        "config_file": "/var/www/html/example-a-Server/config.php",
+        "symlink_name": "example-a",
+        "symlink_target": "example-a-Server/public",
+        "backup_web_root": True
+    },
+    "example-b": {
+        "config_file": "/var/www/html/example-b-Server/config.php",
+        "symlink_name": "example-b",
+        "symlink_target": "example-b-Server/public",
+        "backup_web_root": False,
+        "clone_web_root_from": "example-a"
     }
 }
 
@@ -162,13 +168,13 @@ def load_config():
 
     if not os.path.exists(path):
         print(f"[CONFIG] First run – creating default config at {path}")
-        save_config(DEFAULT_CONFIG)
-        return json.loads(json.dumps(DEFAULT_CONFIG))
+        save_config(FIRST_RUN_TEMPLATE)
+        return json.loads(json.dumps(FIRST_RUN_TEMPLATE))
     try:
         with open(path, 'r') as f:
             user_cfg = json.load(f)
     except json.JSONDecodeError as e:
-        print(f"[CONFIG] ERROR: {path} is not valid JSON: {e}", file=sys.stderr)
+        print_error(f"{path} is not valid JSON: {e}")
         sys.exit(1)
     merged = json.loads(json.dumps(DEFAULT_CONFIG))
     _deep_merge(merged, user_cfg)
@@ -177,23 +183,41 @@ def load_config():
 
 def _migrate_config(cfg):
     """
-    Migrate old (primary_server / secondary_server) schema to the new
-    per-server (backup_web_root / clone_web_root_from) schema.
-    Idempotent — safe to call on already-migrated configs.
+    Idempotent migration/cleanup:
+      - old primary_server / secondary_server -> per-server flags
+      - drop leftover example-a / example-b placeholders once real servers exist
+      - bump version to 2
+      - remove cosmetic null clone_web_root_from
     """
     old_primary = cfg.pop('primary_server', None)
     old_secondary = cfg.pop('secondary_server', None)
-    if not old_primary and not old_secondary:
-        return
-    for name, scfg in cfg.get('servers', {}).items():
-        if 'backup_web_root' in scfg:
-            continue  # already migrated
-        if name == old_secondary:
-            scfg['backup_web_root'] = False
-            scfg['clone_web_root_from'] = old_primary
-        else:
-            scfg['backup_web_root'] = True
-            scfg.setdefault('clone_web_root_from', None)
+
+    if old_primary or old_secondary:
+        for name, scfg in cfg.get('servers', {}).items():
+            if 'backup_web_root' in scfg:
+                continue  # already migrated
+            if name == old_secondary:
+                scfg['backup_web_root'] = False
+                scfg['clone_web_root_from'] = old_primary
+            else:
+                scfg['backup_web_root'] = True
+
+    # Drop placeholder servers once user has real ones. Never leaves config
+    # empty, so a fresh first-run file keeps the examples until the user adds
+    # their own servers.
+    placeholders = {'example-a', 'example-b'}
+    real = set(cfg.get('servers', {}).keys()) - placeholders
+    if real:
+        for p in placeholders:
+            cfg['servers'].pop(p, None)
+
+    # Normalise version
+    cfg['version'] = 2
+
+    # Cosmetic: drop clone_web_root_from: null on non-clone servers
+    for scfg in cfg.get('servers', {}).values():
+        if 'clone_web_root_from' in scfg and scfg['clone_web_root_from'] is None:
+            scfg.pop('clone_web_root_from')
 
 # ---- Load the config and expose module-level names (so the rest of the file
 # ---- keeps working unchanged) ----
