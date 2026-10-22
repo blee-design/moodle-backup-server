@@ -2156,6 +2156,17 @@ def run_menu():
 # Original CLI entry point (kept for scripting / cron)
 # ----------------------------------------------------------------------
 def main():
+    # Root check – console script bypasses the __main__ block, so enforce here too
+    if os.geteuid() != 0:
+        print_error("This script must be run as root (sudo).")
+        sys.exit(1)
+
+    # No arguments → interactive menu (same behaviour as `python backup_server.py`)
+    if len(sys.argv) == 1:
+        matrix_intro()
+        run_menu()
+        return
+
     parser = argparse.ArgumentParser(
         description="Backup, restore, upgrade, and manage Moodle servers (primary and exam)."
     )
