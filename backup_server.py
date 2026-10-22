@@ -86,7 +86,7 @@ PHP_BIN = 'php'
 CONFIG_FILE_NAME = '.moodle_ninja_config.json'
 
 DEFAULT_CONFIG = {
-    "version": 1,
+    "version": 2,
     "php_bin": "php",
     "web_parent": "/var/www/html",
     "db_charset": "utf8mb4",
@@ -95,18 +95,19 @@ DEFAULT_CONFIG = {
         "temp", "cache", "sessions", "localcache", "repository",
         "theme", "environment", "filter", "calendar", "muc", "lang", "rss", "search"
     ],
-    "primary_server": "psc",
-    "secondary_server": "exam",
     "servers": {
-        "psc": {
-            "config_file": "/var/www/html/psc-Server/config.php",
-            "symlink_name": "psc",
-            "symlink_target": "psc-Server/public"
+        "example-a": {
+            "config_file": "/var/www/html/example-a-Server/config.php",
+            "symlink_name": "example-a",
+            "symlink_target": "example-a-Server/public",
+            "backup_web_root": true
         },
-        "exam": {
-            "config_file": "/var/www/html/exam-Server/config.php",
-            "symlink_name": "exam",
-            "symlink_target": "exam-Server/public"
+        "example-b": {
+            "config_file": "/var/www/html/example-b-Server/config.php",
+            "symlink_name": "example-b",
+            "symlink_target": "example-b-Server/public",
+            "backup_web_root": false,
+            "clone_web_root_from": "example-a"
         }
     }
 }
@@ -171,20 +172,45 @@ def load_config():
         sys.exit(1)
     merged = json.loads(json.dumps(DEFAULT_CONFIG))
     _deep_merge(merged, user_cfg)
+    _migrate_config(merged)
     return merged
+
+def _migrate_config(cfg):
+    """
+    Migrate old (primary_server / secondary_server) schema to the new
+    per-server (backup_web_root / clone_web_root_from) schema.
+    Idempotent — safe to call on already-migrated configs.
+    """
+    old_primary = cfg.pop('primary_server', None)
+    old_secondary = cfg.pop('secondary_server', None)
+    if not old_primary and not old_secondary:
+        return
+    for name, scfg in cfg.get('servers', {}).items():
+        if 'backup_web_root' in scfg:
+            continue  # already migrated
+        if name == old_secondary:
+            scfg['backup_web_root'] = False
+            scfg['clone_web_root_from'] = old_primary
+        else:
+            scfg['backup_web_root'] = True
+            scfg.setdefault('clone_web_root_from', None)
 
 # ---- Load the config and expose module-level names (so the rest of the file
 # ---- keeps working unchanged) ----
-CONFIG            = load_config()
-PHP_BIN           = CONFIG.get('php_bin', 'php')
-PRIMARY_SERVER    = CONFIG['primary_server']
-SECONDARY_SERVER  = CONFIG['secondary_server']
-WEB_PARENT        = CONFIG['web_parent']
-DB_CHARSET        = CONFIG['db_charset']
-DB_COLLATION      = CONFIG['db_collation']
-WRITABLE_DIRS     = CONFIG['writable_dirs']
-SERVERS           = CONFIG['servers']
-CONFIG_PATHS      = {k: v['config_file'] for k, v in SERVERS.items()}
+CONFIG         = load_config()
+PHP_BIN        = CONFIG.get('php_bin', 'php')
+WEB_PARENT     = CONFIG['web_parent']
+DB_CHARSET     = CONFIG['db_charset']
+DB_COLLATION   = CONFIG['db_collation']
+WRITABLE_DIRS  = CONFIG['writable_dirs']
+SERVERS        = CONFIG['servers']
+CONFIG_PATHS   = {k: v['config_file'] for k, v in SERVERS.items()}
+
+if not SERVERS:
+    print_warning(
+        "No servers configured in ~/.moodle_ninja_config.json. "
+        "Use the menu (9 → 2) or edit the file to add at least one server."
+    )
 
 # ----------------------------------------------------------------------
 # HACKER-STYLE AESTHETICS
@@ -1239,10 +1265,81 @@ def backup(backup_location, verbose):
 
     try:
         for server_name, cfg in SERVERS.items():
-            server_cfg = load_server_config(server_name)   # <-- load dynamic config
+            server_cfg = load_server_config(server_name)
             print_info(f"Harvesting server: {server_name}")
             server_dir = os.path.join(temp_dir, server_name)
             os.makedirs(server_dir, exist_ok=True)
+
+            # 1. Config file — always captured. Small, and protects
+            #    against a corrupt html/ copy. Restored unconditionally.
+            cfg_src = server_cfg['config_file']
+            cfg_dst = os.path.join(server_dir, f"config-{server_name}.php")
+            if os.path.exists(cfg_src):
+                run_cmd(['cp', '-a', cfg_src, cfg_dst], verbose)
+                if verbose:
+                    print_verbose(f"Config captured: {cfg_src} -> {cfg_dst}")
+                else:
+                    print_info(f"Config for {server_name} secured.")
+            else:
+                print_warning(f"Config file {cfg_src} not found, skipping.")
+
+            # 2. Database dump
+            print_info(f"Dumping database '{server_cfg['db_name']}'...")
+            db_dump = os.path.join(server_dir, 'db.sql')
+            current_auth = ensure_db_access(server_cfg['db_name'])
+            dump_cmd = [get_db_dump()] + current_auth + [
+                f'--default-character-set={DB_CHARSET}', server_cfg['db_name']
+            ]
+            stop = spinner(f"Dumping database '{server_cfg['db_name']}'")
+            try:
+                with open(db_dump, 'wb') as f:
+                    subprocess.run(dump_cmd, stdout=f, check=True)
+            finally:
+                stop()
+            if verbose:
+                print_verbose(f"Database '{server_cfg['db_name']}' dumped to {db_dump}")
+            else:
+                print_info("Database extracted.")
+
+            # 3. Web root — only if this server owns its web root
+            if server_cfg.get('backup_web_root', True):
+                print_verbose(random.choice(HACKER_PHRASES), component='web')
+                print_info(f"Copying web root for {server_name}...")
+                web_src = server_cfg['web_root']
+                web_dst = os.path.join(server_dir, 'html')
+                if os.path.exists(web_src):
+                    run_cmd(['cp', '-a', '--reflink=auto', web_src, web_dst], verbose)
+                    if verbose:
+                        print_verbose(f"Web root copied: {web_src} -> {web_dst}")
+                    else:
+                        print_info("Web root archived.")
+                else:
+                    print_warning(f"Web root {web_src} not found, skipping.")
+            else:
+                clone_src = server_cfg.get('clone_web_root_from')
+                if verbose:
+                    print_verbose(
+                        f"{server_name} web root omitted "
+                        f"(will clone from '{clone_src}' on restore)."
+                    )
+                else:
+                    print_info(
+                        f"{server_name} web root omitted "
+                        f"(will clone from '{clone_src}' on restore)."
+                    )
+
+            # 4. Data directory — always captured (each server has its own)
+            print_info(f"Copying data directory for {server_name}...")
+            data_src = server_cfg['data_dir']
+            data_dst = os.path.join(server_dir, 'data')
+            if os.path.exists(data_src):
+                run_cmd(['cp', '-a', '--reflink=auto', data_src, data_dst], verbose)
+                if verbose:
+                    print_verbose(f"Data directory copied: {data_src} -> {data_dst}")
+                else:
+                    print_info("Data directory archived.")
+            else:
+                print_warning(f"Data dir {data_src} not found, skipping.")
 
             # Primary's config.php comes for free inside html/. Exam's web
             # root is NOT backed up (it is cloned from primary on restore),
@@ -1463,6 +1560,18 @@ def load_server_config(server_name, require_config_file=True):
     prefix   = get_var('prefix') or 'mdl_'
     wwwroot  = get_var('wwwroot') or ''
 
+    # Derive symlink info from Moodle's own $CFG->wwwroot when not set.
+    # E.g. wwwroot = "https://example.com/psc" -> symlink_name = "psc"
+    symlink_name   = cfg.get('symlink_name')
+    symlink_target = cfg.get('symlink_target')
+    if not symlink_name and wwwroot:
+        last = wwwroot.rstrip('/').split('/')[-1]
+        # Only use it if it's a path segment, not a bare host
+        if last and '.' not in last:
+            symlink_name = last
+    if not symlink_target and web_root:
+        symlink_target = os.path.basename(web_root.rstrip('/')) + '/public'
+
     return {
         'web_root': web_root,
         'data_dir': dataroot,
@@ -1472,7 +1581,49 @@ def load_server_config(server_name, require_config_file=True):
         'table_prefix': prefix,
         'wwwroot': wwwroot,
         'config_file': config_path,
+        'symlink_name': symlink_name,
+        'symlink_target': symlink_target,
+        'backup_web_root': cfg.get('backup_web_root', True),
+        'clone_web_root_from': cfg.get('clone_web_root_from'),
     }
+
+# ----------------------------------------------------------------------
+# Restore ordering — topological sort over clone_web_root_from
+# ----------------------------------------------------------------------
+def _server_restore_order(servers):
+    """
+    Return server names in an order where every clone source is restored
+    before its dependents. Cycle-safe: a cycle becomes a warning and the
+    offending clone falls back to its own backup html/.
+    """
+    order = []
+    visiting = set()
+    done = set()
+
+    def visit(name, chain):
+        if name in done:
+            return
+        if name in visiting:
+            print_warning(
+                "Circular clone_web_root_from detected: " + " -> ".join(chain + [name])
+            )
+            return
+        visiting.add(name)
+        src = (servers.get(name) or {}).get('clone_web_root_from')
+        if src:
+            if src in servers:
+                visit(src, chain + [name])
+            else:
+                print_warning(
+                    f"Server '{name}' clones from '{src}' which is not in config — ignoring."
+                )
+        visiting.discard(name)
+        done.add(name)
+        order.append(name)
+
+    for name in servers:
+        visit(name, [])
+    return order
 
 # ----------------------------------------------------------------------
 # Restore main function
@@ -1542,225 +1693,159 @@ def restore(restore_location, verbose):
             print_error(f"Primary server '{PRIMARY_SERVER}' backup not found.")
             sys.exit(1)
 
-        # ========== PRIMARY SERVER RESTORE ==========
-        primary_info = SERVERS[PRIMARY_SERVER]                 # for symlink name/target
-        primary_cfg = load_server_config(PRIMARY_SERVER, require_config_file=False)  # config.php comes with the web root
-        if os.path.isdir(web_backup):
-            if handle_existing(PRIMARY_SERVER, 'html', web_target, is_dir=True,
-                               backup_dir=backup_root, policy=policy, verbose=verbose):
-                os.makedirs(os.path.dirname(web_target), exist_ok=True)
-                shutil.move(web_backup, web_target)
-                if verbose:
-                    print_verbose(f"Restored web root: {web_backup} -> {web_target}")
-                restored_web_roots = {PRIMARY_SERVER: web_target}
-            else:
-                print_error("Primary web root restoration skipped – cannot proceed.")
-                sys.exit(1)
-        else:
-            print_error(f"Web backup for primary server not found at {web_backup}")
-            sys.exit(1)
+        # ========== RESTORE (all servers, in dependency order) ==========
+        restored_web_roots = {}
 
-        # Config: config.php came back with the restored web root.
-        # Re-load the whole config from it, so data_dir / db_name / db_user
-        # / db_pass are all correct — no separate config backup needed.
-        cfg_target = primary_cfg['config_file']
-        db_user = db_pass = None
-        if os.path.isfile(cfg_target):
-            primary_cfg = load_server_config(PRIMARY_SERVER)   # now config.php exists
-            db_user = primary_cfg['db_user']
-            db_pass = primary_cfg['db_pass']
-            if verbose:
-                print_verbose(
-                    f"Re-read config.php: db={primary_cfg['db_name']}, "
-                    f"data={primary_cfg['data_dir']}, user={db_user or '(none)'}"
-                )
-        else:
-            print_warning(f"config.php not found at {cfg_target} after restore — using config.json values only.")
+        for server_name in _server_restore_order(SERVERS):
+            server_backup_dir = os.path.join(temp_dir, server_name)
+            if not os.path.isdir(server_backup_dir):
+                print_warning(f"Backup for server '{server_name}' not found — skipping.")
+                continue
 
-        # Primary data
-        data_backup = os.path.join(server_backup, 'data')
-        data_target = primary_cfg['data_dir']
-        if os.path.isdir(data_backup):
-            if handle_existing(PRIMARY_SERVER, 'data', data_target, is_dir=True,
-                               backup_dir=backup_root, policy=policy, verbose=verbose):
-                os.makedirs(os.path.dirname(data_target), exist_ok=True)
-                shutil.move(data_backup, data_target)
-                if verbose:
-                    print_verbose(f"Restored data dir: {data_backup} -> {data_target}")
-        else:
-            print_warning("Data backup for primary not found, skipping.")
+            print_info(f"\nRestoring server: {server_name}")
+            server_cfg = load_server_config(server_name, require_config_file=False)
 
-        fix_permissions(PRIMARY_SERVER, primary_cfg, verbose)
+            # ---------- 1. Web root ----------
+            web_target = server_cfg['web_root']
+            clone_from = server_cfg.get('clone_web_root_from')
+            html_backup = os.path.join(server_backup_dir, 'html')
 
-        # Primary database
-        db_backup = os.path.join(server_backup, 'db.sql')
-        if os.path.isfile(db_backup):
-            db_exists = database_exists(primary_cfg['db_name'], auth_args, verbose)
-            proceed_with_db = True
-            if db_exists:
-                proceed_with_db = handle_existing_database(
-                    primary_cfg['db_name'], auth_args, backup_root, PRIMARY_SERVER, policy, verbose
-                )
-            if proceed_with_db:
-                create_database_if_not_exists(primary_cfg['db_name'], auth_args, verbose)
-                client = get_db_client()
-                db_cmd = [client] + auth_args + [f'--default-character-set={DB_CHARSET}', primary_cfg['db_name']]
-                with open(db_backup, 'rb') as f:
-                    run_cmd(db_cmd, verbose, stdin=f)
-                if verbose:
-                    print_verbose(f"Restored database '{primary_cfg['db_name']}' from {db_backup}")
-
-                if db_user and db_pass:
-                    grant_database_privileges(primary_cfg['db_name'], db_user, db_pass, auth_args, verbose)
-                else:
-                    print_warning(f"Could not extract dbuser/dbpass from config, skipping privilege grant for '{primary_cfg['db_name']}'.")
-            else:
-                print_info(f"Skipping database restore for '{primary_cfg['db_name']}' as per policy.")
-        else:
-            print_warning("Database dump for primary not found, skipping.")
-
-        # Primary symlink
-        link_name = os.path.join(WEB_PARENT, primary_info['symlink_name'])
-        link_target = primary_info['symlink_target']
-        if os.path.lexists(link_name):
-            os.unlink(link_name)
-        os.symlink(link_target, link_name)
-        if verbose:
-            print_verbose(f"Symlink created: {link_name} -> {link_target}")
-
-        # ========== SECONDARY (EXAM) SERVER RESTORE ==========
-        exam_info = SERVERS[SECONDARY_SERVER]
-        exam_cfg = load_server_config(SECONDARY_SERVER, require_config_file=False)
-        server_backup_exam = os.path.join(temp_dir, SECONDARY_SERVER)
-        if not os.path.isdir(server_backup_exam):
-            print_warning(f"Exam server backup not found, will try to clone from primary and restore config from backup if available.")
-            os.makedirs(exam_cfg['web_root'], exist_ok=True)
-            os.makedirs(exam_cfg['data_dir'], exist_ok=True)
-
-        print_info(f"\nRestoring secondary server: {SECONDARY_SERVER}")
-
-        # Clone exam web root from primary (if primary web root exists)
-        if restored_web_roots.get(PRIMARY_SERVER) and os.path.isdir(restored_web_roots[PRIMARY_SERVER]):
-            source_web = restored_web_roots[PRIMARY_SERVER]
-            web_target_exam = exam_cfg['web_root']
-            if handle_existing(SECONDARY_SERVER, 'html', web_target_exam, is_dir=True,
-                               backup_dir=backup_root, policy=policy, verbose=verbose):
-                print_info(f"Cloning {SECONDARY_SERVER} web root from {PRIMARY_SERVER}: {source_web} -> {web_target_exam}")
-                os.makedirs(os.path.dirname(web_target_exam), exist_ok=True)
-                if sys.version_info >= (3, 8):
-                    shutil.copytree(source_web, web_target_exam, dirs_exist_ok=True, symlinks=True)
-                else:
-                    run_cmd(['cp', '-a', '--reflink=auto', source_web, web_target_exam], verbose)
-                restored_web_roots[SECONDARY_SERVER] = web_target_exam
-            else:
-                print_warning("Exam web root cloning skipped – will attempt to restore from backup.")
-                web_backup_exam = os.path.join(server_backup_exam, 'html')
-                if os.path.isdir(web_backup_exam):
-                    if handle_existing(SECONDARY_SERVER, 'html', web_target_exam, is_dir=True,
+            if clone_from:
+                source_web = restored_web_roots.get(clone_from)
+                if source_web and os.path.isdir(source_web):
+                    if handle_existing(server_name, 'html', web_target, is_dir=True,
                                        backup_dir=backup_root, policy=policy, verbose=verbose):
-                        os.makedirs(os.path.dirname(web_target_exam), exist_ok=True)
-                        shutil.move(web_backup_exam, web_target_exam)
-                        restored_web_roots[SECONDARY_SERVER] = web_target_exam
+                        print_info(f"Cloning {server_name} web root from '{clone_from}'...")
+                        os.makedirs(os.path.dirname(web_target), exist_ok=True)
+                        if sys.version_info >= (3, 8):
+                            shutil.copytree(source_web, web_target,
+                                            dirs_exist_ok=True, symlinks=True)
+                        else:
+                            run_cmd(['cp', '-a', '--reflink=auto', source_web, web_target], verbose)
+                        restored_web_roots[server_name] = web_target
                     else:
-                        print_warning("Exam web root not restored, will skip.")
+                        print_warning(f"Web root clone skipped for {server_name}.")
                 else:
-                    print_warning("Exam web backup not found, cannot restore.")
-        else:
-            print_warning("Primary web root not available for cloning; will try to restore exam from backup.")
-            web_backup_exam = os.path.join(server_backup_exam, 'html')
-            if os.path.isdir(web_backup_exam):
-                if handle_existing(SECONDARY_SERVER, 'html', web_target_exam, is_dir=True,
+                    print_warning(
+                        f"Cannot clone {server_name} from '{clone_from}' "
+                        f"(source not restored). Trying own backup html/..."
+                    )
+                    if os.path.isdir(html_backup):
+                        if handle_existing(server_name, 'html', web_target, is_dir=True,
+                                           backup_dir=backup_root, policy=policy, verbose=verbose):
+                            os.makedirs(os.path.dirname(web_target), exist_ok=True)
+                            shutil.move(html_backup, web_target)
+                            restored_web_roots[server_name] = web_target
+            else:
+                if os.path.isdir(html_backup):
+                    if handle_existing(server_name, 'html', web_target, is_dir=True,
+                                       backup_dir=backup_root, policy=policy, verbose=verbose):
+                        os.makedirs(os.path.dirname(web_target), exist_ok=True)
+                        shutil.move(html_backup, web_target)
+                        restored_web_roots[server_name] = web_target
+                        if verbose:
+                            print_verbose(f"Web root restored: {html_backup} -> {web_target}")
+                else:
+                    print_warning(f"No html/ backup for {server_name} and not a clone target.")
+
+            # ---------- 2. Config file (always overwrite) ----------
+            cfg_backup = os.path.join(server_backup_dir, f"config-{server_name}.php")
+            cfg_target = server_cfg['config_file']
+            if os.path.isfile(cfg_backup):
+                if os.path.isfile(cfg_target):
+                    backup_existing(server_name, 'config', cfg_target, backup_root, verbose)
+                os.makedirs(os.path.dirname(cfg_target), exist_ok=True)
+                shutil.copy2(cfg_backup, cfg_target)
+                if verbose:
+                    print_verbose(f"Config restored: {cfg_backup} -> {cfg_target}")
+                else:
+                    print_info(f"Config for {server_name} restored.")
+            elif os.path.isfile(cfg_target):
+                print_warning(f"No config backup for {server_name}; using existing config.php.")
+            else:
+                print_warning(
+                    f"No config.php for {server_name} anywhere — "
+                    f"will fall back to config.json paths/DB values."
+                )
+
+            # ---------- 3. Re-read config (Moodle keywords are the truth) ----------
+            server_cfg = load_server_config(server_name, require_config_file=False)
+            if os.path.isfile(server_cfg['config_file']):
+                server_cfg = load_server_config(server_name)
+                if verbose:
+                    print_verbose(
+                        f"Re-read config.php: db={server_cfg['db_name']}, "
+                        f"data={server_cfg['data_dir']}, "
+                        f"user={server_cfg['db_user'] or '(none)'}"
+                    )
+
+            # ---------- 4. Data directory ----------
+            data_backup = os.path.join(server_backup_dir, 'data')
+            data_target = server_cfg['data_dir']
+            if os.path.isdir(data_backup):
+                if handle_existing(server_name, 'data', data_target, is_dir=True,
                                    backup_dir=backup_root, policy=policy, verbose=verbose):
-                    os.makedirs(os.path.dirname(web_target_exam), exist_ok=True)
-                    shutil.move(web_backup_exam, web_target_exam)
-                    restored_web_roots[SECONDARY_SERVER] = web_target_exam
+                    os.makedirs(os.path.dirname(data_target), exist_ok=True)
+                    shutil.move(data_backup, data_target)
+                    if verbose:
+                        print_verbose(f"Data restored: {data_backup} -> {data_target}")
             else:
-                print_warning("Exam web backup not found, skipping.")
+                print_warning(f"No data/ backup for {server_name}; creating empty data dir.")
+                os.makedirs(data_target, exist_ok=True)
 
-        # Exam's web root was cloned from primary, so its config.php currently
-        # points at primary's DB / user / dataroot. Overwrite it with exam's
-        # own config.php captured during backup, THEN re-read everything.
-        exam_config_target = exam_cfg['config_file']
-        cfg_backup_exam = os.path.join(server_backup_exam, f"config-{SECONDARY_SERVER}.php")
-        db_user_exam = db_pass_exam = None
-        if os.path.isfile(cfg_backup_exam):
-            os.makedirs(os.path.dirname(exam_config_target), exist_ok=True)
-            if os.path.isfile(exam_config_target):
-                backup_existing(SECONDARY_SERVER, 'config',
-                                exam_config_target, backup_root, verbose)
-            shutil.copy2(cfg_backup_exam, exam_config_target)
-            print_info("Restored exam's own config.php (overwrote cloned primary config).")
-            exam_cfg = load_server_config(SECONDARY_SERVER)
-            db_user_exam = exam_cfg['db_user']
-            db_pass_exam = exam_cfg['db_pass']
-            if verbose:
-                print_verbose(
-                    f"Exam config loaded: db={exam_cfg['db_name']}, "
-                    f"data={exam_cfg['data_dir']}, user={db_user_exam or '(none)'}"
-                )
-        elif os.path.isfile(exam_config_target):
-            exam_cfg = load_server_config(SECONDARY_SERVER)
-            db_user_exam = exam_cfg['db_user']
-            db_pass_exam = exam_cfg['db_pass']
-            print_warning("No exam config backup found; using config.php already in place "
-                          "(may still point at primary — verify manually).")
-        else:
-            print_warning(
-                f"Exam config missing ({cfg_backup_exam}, {exam_config_target}). "
-                "Exam DB restore will use config.json values only — this will likely fail."
-            )
+            # ---------- 5. Permissions ----------
+            fix_permissions(server_name, server_cfg, verbose)
 
-        # Exam data directory
-        data_backup_exam = os.path.join(server_backup_exam, 'data')
-        data_target_exam = exam_cfg['data_dir']
-        if os.path.isdir(data_backup_exam):
-            if handle_existing(SECONDARY_SERVER, 'data', data_target_exam, is_dir=True,
-                               backup_dir=backup_root, policy=policy, verbose=verbose):
-                os.makedirs(os.path.dirname(data_target_exam), exist_ok=True)
-                shutil.move(data_backup_exam, data_target_exam)
-                if verbose:
-                    print_verbose(f"Restored exam data dir: {data_backup_exam} -> {data_target_exam}")
-        else:
-            print_warning("Exam data backup not found, creating empty data directory.")
-            os.makedirs(data_target_exam, exist_ok=True)
-
-        fix_permissions(SECONDARY_SERVER, exam_cfg, verbose)
-
-        # Exam database
-        db_backup_exam = os.path.join(server_backup_exam, 'db.sql')
-        if os.path.isfile(db_backup_exam):
-            db_exists = database_exists(exam_cfg['db_name'], auth_args, verbose)
-            proceed_with_db = True
-            if db_exists:
-                proceed_with_db = handle_existing_database(
-                    exam_cfg['db_name'], auth_args, backup_root, SECONDARY_SERVER, policy, verbose
-                )
-            if proceed_with_db:
-                create_database_if_not_exists(exam_cfg['db_name'], auth_args, verbose)
-                client = get_db_client()
-                db_cmd = [client] + auth_args + [f'--default-character-set={DB_CHARSET}', exam_cfg['db_name']]
-                with open(db_backup_exam, 'rb') as f:
-                    run_cmd(db_cmd, verbose, stdin=f)
-                if verbose:
-                    print_verbose(f"Restored exam database '{exam_cfg['db_name']}' from {db_backup_exam}")
-
-                if db_user_exam and db_pass_exam:
-                    grant_database_privileges(exam_cfg['db_name'], db_user_exam, db_pass_exam, auth_args, verbose)
+            # ---------- 6. Database ----------
+            db_backup = os.path.join(server_backup_dir, 'db.sql')
+            if os.path.isfile(db_backup):
+                db_name = server_cfg['db_name']
+                db_user = server_cfg['db_user']
+                db_pass = server_cfg['db_pass']
+                db_exists = database_exists(db_name, auth_args, verbose)
+                proceed = True
+                if db_exists:
+                    proceed = handle_existing_database(
+                        db_name, auth_args, backup_root, server_name, policy, verbose
+                    )
+                if proceed:
+                    create_database_if_not_exists(db_name, auth_args, verbose)
+                    client = get_db_client()
+                    db_cmd = [client] + auth_args + [
+                        f'--default-character-set={DB_CHARSET}', db_name
+                    ]
+                    with open(db_backup, 'rb') as f:
+                        run_cmd(db_cmd, verbose, stdin=f)
+                    if verbose:
+                        print_verbose(f"Database '{db_name}' restored from {db_backup}")
+                    if db_user and db_pass:
+                        grant_database_privileges(db_name, db_user, db_pass, auth_args, verbose)
+                    else:
+                        print_warning(
+                            f"No dbuser/dbpass in {server_name}'s config — "
+                            f"skipping privilege grant for '{db_name}'."
+                        )
                 else:
-                    print_warning(f"Could not extract dbuser/dbpass from exam config, skipping privilege grant for '{exam_cfg['db_name']}'.")
+                    print_info(f"Skipping database restore for '{db_name}' as per policy.")
             else:
-                print_info(f"Skipping exam database restore for '{exam_cfg['db_name']}' as per policy.")
-        else:
-            print_warning("Exam database dump not found, skipping.")
+                print_warning(f"No db.sql for {server_name}; skipping database.")
 
-        # Exam symlink
-        link_name_exam = os.path.join(WEB_PARENT, exam_info['symlink_name'])
-        link_target_exam = exam_info['symlink_target']
-        if os.path.lexists(link_name_exam):
-            os.unlink(link_name_exam)
-        os.symlink(link_target_exam, link_name_exam)
-        if verbose:
-            print_verbose(f"Symlink created: {link_name_exam} -> {link_target_exam}")
+            # ---------- 7. Symlink (only if configured / derivable) ----------
+            link_name = server_cfg.get('symlink_name')
+            link_target = server_cfg.get('symlink_target')
+            if link_name and link_target:
+                full_link = os.path.join(WEB_PARENT, link_name)
+                if os.path.lexists(full_link):
+                    os.unlink(full_link)
+                os.symlink(link_target, full_link)
+                if verbose:
+                    print_verbose(f"Symlink: {full_link} -> {link_target}")
+            else:
+                if verbose:
+                    print_verbose(
+                        f"No symlink for {server_name} "
+                        f"(symlink_name/target absent and wwwroot not derivable)."
+                    )
 
         print_success("\nRestore completed successfully.")
         if os.path.exists(backup_root) and os.listdir(backup_root):
@@ -1850,93 +1935,115 @@ def restore_previous(backup_dir, verbose):
         ensure_server_access()
         policy = get_conflict_policy(verbose)
 
-        for server_name, cfg in SERVERS.items():
+        restored_web_roots = {}
+        for server_name in _server_restore_order(SERVERS):
             server_backup_dir = os.path.join(backup_dir, server_name)
             if not os.path.isdir(server_backup_dir):
                 print_info(f"No backup found for server '{server_name}', skipping.")
                 continue
 
             print_info(f"\nRestoring server: {server_name}")
+            server_cfg = load_server_config(server_name, require_config_file=False)
 
-            # Web root
-            web_backup_path = os.path.join(server_backup_dir, 'html', os.path.basename(cfg['web_root']))
-            if os.path.exists(web_backup_path):
-                web_target = cfg['web_root']
+            # ---------- Web root ----------
+            web_target = server_cfg['web_root']
+            clone_from = server_cfg.get('clone_web_root_from')
+            html_backup = os.path.join(server_backup_dir, 'html', os.path.basename(web_target))
+
+            if clone_from and restored_web_roots.get(clone_from):
+                source_web = restored_web_roots[clone_from]
                 if handle_existing(server_name, 'html', web_target, is_dir=True,
                                    backup_dir=temp_backup_root, policy=policy, verbose=verbose):
                     os.makedirs(os.path.dirname(web_target), exist_ok=True)
-                    shutil.move(web_backup_path, web_target)
+                    if sys.version_info >= (3, 8):
+                        shutil.copytree(source_web, web_target,
+                                        dirs_exist_ok=True, symlinks=True)
+                    else:
+                        run_cmd(['cp', '-a', '--reflink=auto', source_web, web_target], verbose)
+                    restored_web_roots[server_name] = web_target
+                    print_info(f"Web root cloned from '{clone_from}'.")
+            elif os.path.exists(html_backup):
+                if handle_existing(server_name, 'html', web_target, is_dir=True,
+                                   backup_dir=temp_backup_root, policy=policy, verbose=verbose):
+                    os.makedirs(os.path.dirname(web_target), exist_ok=True)
+                    shutil.move(html_backup, web_target)
+                    restored_web_roots[server_name] = web_target
                     print_info("Restored web root from backup.")
-                else:
-                    print_info("Skipped web root restore.")
-            else:
-                print("No web root backup found.")
 
-            # Data directory
-            data_backup_path = os.path.join(server_backup_dir, 'data', os.path.basename(cfg['data_dir']))
-            if os.path.exists(data_backup_path):
-                data_target = cfg['data_dir']
+            # ---------- Config ----------
+            cfg_backup = os.path.join(server_backup_dir, 'config', f"config-{server_name}.php")
+            cfg_target = server_cfg['config_file']
+            if os.path.isfile(cfg_backup):
+                if os.path.isfile(cfg_target):
+                    backup_existing(server_name, 'config', cfg_target, temp_backup_root, verbose)
+                os.makedirs(os.path.dirname(cfg_target), exist_ok=True)
+                shutil.copy2(cfg_backup, cfg_target)
+                print_info("Restored config file.")
+            elif os.path.isfile(cfg_target):
+                print_info("Using existing config.php.")
+
+            # ---------- Re-read ----------
+            server_cfg = load_server_config(server_name, require_config_file=False)
+
+            # ---------- Data ----------
+            data_backup = os.path.join(server_backup_dir, 'data',
+                                       os.path.basename(server_cfg['data_dir']))
+            data_target = server_cfg['data_dir']
+            if os.path.exists(data_backup):
                 if handle_existing(server_name, 'data', data_target, is_dir=True,
                                    backup_dir=temp_backup_root, policy=policy, verbose=verbose):
                     os.makedirs(os.path.dirname(data_target), exist_ok=True)
-                    shutil.move(data_backup_path, data_target)
+                    shutil.move(data_backup, data_target)
                     print_info("Restored data directory.")
-                else:
-                    print_info("Skipped data directory restore.")
             else:
                 print("No data directory backup found.")
 
-            # Config: read credentials from the config.php that came back
-            # with the web root. No separate config backup is handled.
-            cfg_target = cfg['config_file']
-            db_user = db_pass = None
-            if os.path.isfile(cfg_target):
-                actual_dbname = get_dbname_from_config(cfg_target)
-                if actual_dbname:
-                    if verbose:
-                        print_verbose(f"DB name from config.php: {actual_dbname} (was {cfg['db_name']})")
-                    cfg['db_name'] = actual_dbname
-                db_user, db_pass = get_dbuser_pass_from_config(cfg_target)
-            else:
-                print_warning(f"config.php not found at {cfg_target} — using config.json value: {cfg['db_name']}")
+            # ---------- Permissions ----------
+            fix_permissions(server_name, server_cfg, verbose)
 
-            # Fix permissions (web root + data dir) only if needed
-            fix_permissions(server_name, cfg, verbose)
-
-            # Database
+            # ---------- Database ----------
             db_backup_dir = os.path.join(server_backup_dir, 'db')
             if os.path.isdir(db_backup_dir):
-                sql_files = glob.glob(os.path.join(db_backup_dir, f"{cfg['db_name']}_backup_*.sql"))
+                sql_files = sorted(
+                    glob.glob(os.path.join(db_backup_dir, f"{server_cfg['db_name']}_backup_*.sql")),
+                    key=os.path.getmtime, reverse=True,
+                )
                 if sql_files:
-                    sql_files.sort(key=os.path.getmtime, reverse=True)
-                    print(f"Database backups found for '{cfg['db_name']}':")
+                    print(f"Database backups found for '{server_cfg['db_name']}':")
                     for i, f in enumerate(sql_files, 1):
-                        mtime = datetime.datetime.fromtimestamp(os.path.getmtime(f)).strftime('%Y-%m-%d %H:%M:%S')
+                        mtime = datetime.datetime.fromtimestamp(
+                            os.path.getmtime(f)
+                        ).strftime('%Y-%m-%d %H:%M:%S')
                         print(f"  {i}. {f} (modified {mtime})")
-                    choice = print_prompt("Enter the number to restore (or 0 to skip): ").strip()
+                    choice = print_prompt("Enter number to restore (or 0 to skip): ").strip()
                     if choice.isdigit() and int(choice) > 0:
                         idx = int(choice) - 1
-                        if idx < len(sql_files):
+                        if 0 <= idx < len(sql_files):
                             selected = sql_files[idx]
-                            db_exists = database_exists(cfg['db_name'], auth_args, verbose)
+                            db_name = server_cfg['db_name']
+                            db_exists = database_exists(db_name, auth_args, verbose)
                             proceed = True
                             if db_exists:
                                 proceed = handle_existing_database(
-                                    cfg['db_name'], auth_args, temp_backup_root, server_name, policy, verbose
+                                    db_name, auth_args, temp_backup_root,
+                                    server_name, policy, verbose,
                                 )
                             if proceed:
-                                create_database_if_not_exists(cfg['db_name'], auth_args, verbose)
+                                create_database_if_not_exists(db_name, auth_args, verbose)
                                 client = get_db_client()
-                                db_cmd = [client] + auth_args + [f'--default-character-set={DB_CHARSET}', cfg['db_name']]
+                                db_cmd = [client] + auth_args + [
+                                    f'--default-character-set={DB_CHARSET}', db_name
+                                ]
                                 with open(selected, 'rb') as f:
                                     run_cmd(db_cmd, verbose, stdin=f)
                                 print_info(f"Restored database from {selected}")
-
-                                # Grant database privileges
-                                if db_user and db_pass:
-                                    grant_database_privileges(cfg['db_name'], db_user, db_pass, auth_args, verbose)
-                                else:
-                                    print_warning(f"Could not extract dbuser/dbpass from config, skipping privilege grant for '{cfg['db_name']}'.")
+                                if server_cfg['db_user'] and server_cfg['db_pass']:
+                                    grant_database_privileges(
+                                        db_name,
+                                        server_cfg['db_user'],
+                                        server_cfg['db_pass'],
+                                        auth_args, verbose,
+                                    )
                         else:
                             print_warning("Invalid number, skipping database restore.")
                     else:
@@ -1946,14 +2053,16 @@ def restore_previous(backup_dir, verbose):
             else:
                 print("No database backup found.")
 
-            # Symlink
-            link_name = os.path.join(WEB_PARENT, cfg['symlink_name'])
-            link_target = cfg['symlink_target']
-            if os.path.lexists(link_name):
-                os.unlink(link_name)
-            os.symlink(link_target, link_name)
-            if verbose:
-                print_verbose(f"Symlink created: {link_name} -> {link_target}")
+            # ---------- Symlink ----------
+            if server_cfg.get('symlink_name') and server_cfg.get('symlink_target'):
+                full_link = os.path.join(WEB_PARENT, server_cfg['symlink_name'])
+                if os.path.lexists(full_link):
+                    os.unlink(full_link)
+                os.symlink(server_cfg['symlink_target'], full_link)
+                if verbose:
+                    print_verbose(
+                        f"Symlink: {full_link} -> {server_cfg['symlink_target']}"
+                    )
 
         print_success("\nRestore from previous backup completed.")
         if os.path.exists(temp_backup_root) and os.listdir(temp_backup_root):
@@ -1990,8 +2099,11 @@ def _choose_server():
     keys = list(SERVERS.keys())
     print("Choose a server:")
     for i, k in enumerate(keys, 1):
-        marker = " (primary)" if k == PRIMARY_SERVER else (" (secondary)" if k == SECONDARY_SERVER else "")
-        print(f"  {i}. {k}{marker}")
+        scfg = SERVERS.get(k, {})
+        tag = ""
+        if scfg.get('clone_web_root_from'):
+            tag = f" (clones web root from '{scfg['clone_web_root_from']}')"
+        print(f"  {i}. {k}{tag}")
     print(f"  0. Back")
     c = print_prompt(f"Choice (1-{len(keys)}, default 1): ").strip() or "1"
     if c == "0":
@@ -2299,7 +2411,7 @@ def main():
     restore_parser.add_argument('-v', '--verbose', action='store_true')
 
     upgrade_parser = subparsers.add_parser('upgrade', help='Upgrade Moodle')
-    upgrade_parser.add_argument('--server', choices=SERVERS.keys(), default=PRIMARY_SERVER)
+    upgrade_parser.add_argument('--server', choices=SERVERS.keys(), required=True)
     upgrade_parser.add_argument('--check', action='store_true')
     upgrade_parser.add_argument('-v', '--verbose', action='store_true')
 
@@ -2310,16 +2422,16 @@ def main():
     maint_parser.add_argument('--allow-admins', dest='no_admins', action='store_false')
     maint_parser.add_argument('--no-admins', dest='no_admins', action='store_true')
     maint_parser.add_argument('--message')
-    maint_parser.add_argument('--server', choices=SERVERS.keys(), default=PRIMARY_SERVER)
+    maint_parser.add_argument('--server', choices=SERVERS.keys(), required=True)
     maint_parser.add_argument('-v', '--verbose', action='store_true')
 
     cron_parser = subparsers.add_parser('cron', help='Run Moodle cron')
-    cron_parser.add_argument('--server', choices=SERVERS.keys(), default=PRIMARY_SERVER)
+    cron_parser.add_argument('--server', choices=SERVERS.keys(), required=True)
     cron_parser.add_argument('--setup', nargs='?', const='* * * * *')
     cron_parser.add_argument('-v', '--verbose', action='store_true')
 
     status_parser = subparsers.add_parser('status', help='Show Moodle status')
-    status_parser.add_argument('--server', choices=SERVERS.keys(), default=PRIMARY_SERVER)
+    status_parser.add_argument('--server', choices=SERVERS.keys(), required=True)
     status_parser.add_argument('-v', '--verbose', action='store_true')
 
     rp_parser = subparsers.add_parser('restore-previous', aliases=['rp'])
@@ -2327,7 +2439,7 @@ def main():
     rp_parser.add_argument('-v', '--verbose', action='store_true')
 
     update_parser = subparsers.add_parser('update', help='Update Moodle code from git and run DB upgrade')
-    update_parser.add_argument('--server', choices=SERVERS.keys(), default=PRIMARY_SERVER)
+    update_parser.add_argument('--server', choices=SERVERS.keys(), required=True)
     update_parser.add_argument('--branch')
     update_parser.add_argument('--no-maintenance', action='store_true')
     update_parser.add_argument('-v', '--verbose', action='store_true')
