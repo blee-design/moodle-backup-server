@@ -1232,17 +1232,8 @@ def backup(backup_location, verbose):
             server_dir = os.path.join(temp_dir, server_name)
             os.makedirs(server_dir, exist_ok=True)
 
-            # Config file (still from SERVERS)
-            cfg_src = cfg['config_file']
-            cfg_dst = os.path.join(server_dir, f"config-{server_name}.php")
-            if os.path.exists(cfg_src):
-                run_cmd(['cp', '-a', cfg_src, cfg_dst], verbose)
-                if verbose:
-                    print_verbose(f"Config captured: {cfg_src} -> {cfg_dst}")
-                else:
-                    print_info("Config file secured.")
-            else:
-                print_warning(f"Config file {cfg_src} not found, skipping.")
+            # Config file lives inside the web root — it comes with the
+            # `html/` copy below, so no separate capture is needed.
 
             # Database dump – use server_cfg
             print_info("Dumping database...")
@@ -1537,43 +1528,23 @@ def restore(restore_location, verbose):
             print_error(f"Web backup for primary server not found at {web_backup}")
             sys.exit(1)
 
-        # Primary config
-        cfg_backup = os.path.join(server_backup, f"config-{PRIMARY_SERVER}.php")
+        # Config: config.php came back with the restored web root. Read it
+        # for the actual DB name/user/password — no separate config backup.
         cfg_target = primary_cfg['config_file']
         db_user = db_pass = None
-        if os.path.isfile(cfg_backup):
-            if handle_existing(PRIMARY_SERVER, 'config', cfg_target, is_dir=False,
-                            backup_dir=backup_root, policy=policy, verbose=verbose):
-                os.makedirs(os.path.dirname(cfg_target), exist_ok=True)
-                # COPY instead of MOVE – keep the backup file in the temp directory
-                shutil.copy2(cfg_backup, cfg_target)
+        if os.path.isfile(cfg_target):
+            actual_dbname = get_dbname_from_config(cfg_target)
+            if actual_dbname:
                 if verbose:
-                    print_verbose(f"Restored config: {cfg_backup} -> {cfg_target}")
-
-                # Extract credentials from the restored file (now at cfg_target)
-                actual_dbname = get_dbname_from_config(cfg_target)
-                if actual_dbname:
-                    if verbose:
-                        print_verbose(f"Extracted database name from config: {actual_dbname} (was {primary_cfg['db_name']})")
-                    primary_cfg['db_name'] = actual_dbname
-                else:
-                    print_warning(f"Could not extract database name from {cfg_target}, using hardcoded value: {primary_cfg['db_name']}")
-
-                db_user, db_pass = get_dbuser_pass_from_config(cfg_target)
-
-                # Live config copy – only if it's a different location
-                config_php = os.path.join(os.path.dirname(cfg_target), 'config.php')
-                if config_php != cfg_target:
-                    if handle_existing(PRIMARY_SERVER, 'config_live', config_php, is_dir=False,
-                                    backup_dir=backup_root, policy=policy, verbose=verbose):
-                        shutil.copy2(cfg_target, config_php)
-                        if verbose:
-                            print_verbose(f"Copied config to live file: {cfg_target} -> {config_php}")
-                else:
-                    if verbose:
-                        print_verbose("Config file and live config.php are the same; no separate copy needed.")
+                    print_verbose(f"DB name from restored config.php: {actual_dbname} (was {primary_cfg['db_name']})")
+                primary_cfg['db_name'] = actual_dbname
+            else:
+                print_warning(f"Could not parse dbname from {cfg_target}; using config.json value: {primary_cfg['db_name']}")
+            db_user, db_pass = get_dbuser_pass_from_config(cfg_target)
+            if verbose:
+                print_verbose(f"config.php in place: {cfg_target}")
         else:
-            print_warning(f"Config backup for primary not found at {cfg_backup}")
+            print_warning(f"config.php not found at {cfg_target} after restore — using config.json values only.")
 
         # Primary data
         data_backup = os.path.join(server_backup, 'data')
@@ -1675,43 +1646,23 @@ def restore(restore_location, verbose):
             else:
                 print_warning("Exam web backup not found, skipping.")
 
-        # Restore exam config from its own backup (if exists)
-        cfg_backup_exam = os.path.join(server_backup_exam, f"config-{SECONDARY_SERVER}.php")
+        # Exam config: read credentials from the config.php that came with
+        # the cloned web root (or was already in place). No separate backup.
         exam_config_target = exam_cfg['config_file']
-        os.makedirs(os.path.dirname(exam_config_target), exist_ok=True)
-
-        if os.path.isfile(cfg_backup_exam):
-            if handle_existing(SECONDARY_SERVER, 'config', exam_config_target, is_dir=False,
-                            backup_dir=backup_root, policy=policy, verbose=verbose):
-                os.makedirs(os.path.dirname(exam_config_target), exist_ok=True)
-                # COPY instead of MOVE
-                shutil.copy2(cfg_backup_exam, exam_config_target)
-                if verbose:
-                    print_verbose(f"Restored exam config from backup: {cfg_backup_exam} -> {exam_config_target}")
-
-            # Extract credentials from the restored exam config
+        db_user_exam = db_pass_exam = None
+        if os.path.isfile(exam_config_target):
             actual_dbname = get_dbname_from_config(exam_config_target)
             if actual_dbname:
                 if verbose:
-                    print_verbose(f"Extracted database name from exam config: {actual_dbname} (was {exam_cfg['db_name']})")
+                    print_verbose(f"DB name from exam config.php: {actual_dbname} (was {exam_cfg['db_name']})")
                 exam_cfg['db_name'] = actual_dbname
             else:
-                print_warning(f"Could not extract database name from {exam_config_target}, using hardcoded value: {exam_cfg['db_name']}")
-
+                print_warning(f"Could not parse dbname from {exam_config_target}; using config.json value: {exam_cfg['db_name']}")
             db_user_exam, db_pass_exam = get_dbuser_pass_from_config(exam_config_target)
-
-            config_php_exam = os.path.join(os.path.dirname(exam_config_target), 'config.php')
-            if config_php_exam != exam_config_target:
-                if handle_existing(SECONDARY_SERVER, 'config_live', config_php_exam, is_dir=False,
-                                backup_dir=backup_root, policy=policy, verbose=verbose):
-                    shutil.copy2(exam_config_target, config_php_exam)
-                    if verbose:
-                        print_verbose(f"Copied exam config to live file: {exam_config_target} -> {config_php_exam}")
-            else:
-                if verbose:
-                    print_verbose("Exam config and live config.php are the same; no separate copy needed.")
+            if verbose:
+                print_verbose(f"Exam config.php in place: {exam_config_target}")
         else:
-            print_warning(f"Exam config file {exam_config_target} still missing. Database credentials will not be set automatically.")
+            print_warning(f"config.php not found at {exam_config_target} after exam restore — using config.json values only.")
 
         # Exam data directory
         data_backup_exam = os.path.join(server_backup_exam, 'data')
@@ -1889,38 +1840,19 @@ def restore_previous(backup_dir, verbose):
             else:
                 print("No data directory backup found.")
 
-            # Config file
-            config_backup = os.path.join(server_backup_dir, 'config', f"config-{server_name}.php")
+            # Config: read credentials from the config.php that came back
+            # with the web root. No separate config backup is handled.
             cfg_target = cfg['config_file']
-            if os.path.isfile(config_backup):
-                if handle_existing(server_name, 'config', cfg_target, is_dir=False,
-                                   backup_dir=temp_backup_root, policy=policy, verbose=verbose):
-                    os.makedirs(os.path.dirname(cfg_target), exist_ok=True)
-                    shutil.move(config_backup, cfg_target)
-                    print_info("Restored config file.")
-                else:
-                    print_info("Skipped config file restore.")
-            else:
-                print("No config file backup found.")
-
-            # Live config.php
-            config_live_backup = os.path.join(server_backup_dir, 'config_live', 'config.php')
-            if os.path.isfile(config_live_backup):
-                config_live_target = os.path.join(os.path.dirname(cfg['config_file']), 'config.php')
-                if handle_existing(server_name, 'config_live', config_live_target, is_dir=False,
-                                   backup_dir=temp_backup_root, policy=policy, verbose=verbose):
-                    os.makedirs(os.path.dirname(config_live_target), exist_ok=True)
-                    shutil.move(config_live_backup, config_live_target)
-                    print_info("Restored live config.php.")
-                else:
-                    print_info("Skipped live config.php restore.")
-            else:
-                print("No live config.php backup found.")
-
-            # Extract db credentials from the restored config file (if it exists)
             db_user = db_pass = None
             if os.path.isfile(cfg_target):
+                actual_dbname = get_dbname_from_config(cfg_target)
+                if actual_dbname:
+                    if verbose:
+                        print_verbose(f"DB name from config.php: {actual_dbname} (was {cfg['db_name']})")
+                    cfg['db_name'] = actual_dbname
                 db_user, db_pass = get_dbuser_pass_from_config(cfg_target)
+            else:
+                print_warning(f"config.php not found at {cfg_target} — using config.json value: {cfg['db_name']}")
 
             # Fix permissions (web root + data dir) only if needed
             fix_permissions(server_name, cfg, verbose)
