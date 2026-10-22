@@ -1402,23 +1402,31 @@ def get_conflict_policy(verbose):
         print_verbose(f"Conflict resolution policy: {policy}")
     return policy
 
-def load_server_config(server_name):
+def load_server_config(server_name, require_config_file=True):
     """
     Merge values from config.json (server entry) with those parsed from the
     Moodle config.php. Priority:
         config.json override > config.php > built-in fallback.
     Credentials (dbuser/dbpass) always come from config.php — never stored in
     config.json, so the config file stays credential-free.
+
+    If require_config_file=False, a missing config.php is tolerated; paths
+    come from config.json and db_* stay empty. Restore uses this because
+    config.php only lands on disk *after* the web root is restored.
     """
     cfg = SERVERS[server_name]
     config_path = cfg['config_file']
-    if not os.path.isfile(config_path):
+    content = ''
+    if os.path.isfile(config_path):
+        with open(config_path, 'r') as f:
+            content = f.read()
+    elif require_config_file:
         print_error(f"Config file {config_path} not found for {server_name}")
         sys.exit(1)
-    with open(config_path, 'r') as f:
-        content = f.read()
 
     def get_var(name):
+        if not content:
+            return None
         pattern = r'\$CFG->' + re.escape(name) + r'\s*=\s*([\'"])([^\'"]+)\1\s*;'
         m = re.search(pattern, content)
         return m.group(2) if m else None
@@ -1510,9 +1518,9 @@ def restore(restore_location, verbose):
             print_error(f"Primary server '{PRIMARY_SERVER}' backup not found.")
             sys.exit(1)
 
-        print_info(f"\nRestoring primary server: {PRIMARY_SERVER}")
-        web_target = primary_cfg['web_root']
-        web_backup = os.path.join(server_backup, 'html')
+        # ========== PRIMARY SERVER RESTORE ==========
+        primary_info = SERVERS[PRIMARY_SERVER]                 # for symlink name/target
+        primary_cfg = load_server_config(PRIMARY_SERVER, require_config_file=False)  # config.php comes with the web root
         if os.path.isdir(web_backup):
             if handle_existing(PRIMARY_SERVER, 'html', web_target, is_dir=True,
                                backup_dir=backup_root, policy=policy, verbose=verbose):
@@ -1528,21 +1536,20 @@ def restore(restore_location, verbose):
             print_error(f"Web backup for primary server not found at {web_backup}")
             sys.exit(1)
 
-        # Config: config.php came back with the restored web root. Read it
-        # for the actual DB name/user/password — no separate config backup.
+        # Config: config.php came back with the restored web root.
+        # Re-load the whole config from it, so data_dir / db_name / db_user
+        # / db_pass are all correct — no separate config backup needed.
         cfg_target = primary_cfg['config_file']
         db_user = db_pass = None
         if os.path.isfile(cfg_target):
-            actual_dbname = get_dbname_from_config(cfg_target)
-            if actual_dbname:
-                if verbose:
-                    print_verbose(f"DB name from restored config.php: {actual_dbname} (was {primary_cfg['db_name']})")
-                primary_cfg['db_name'] = actual_dbname
-            else:
-                print_warning(f"Could not parse dbname from {cfg_target}; using config.json value: {primary_cfg['db_name']}")
-            db_user, db_pass = get_dbuser_pass_from_config(cfg_target)
+            primary_cfg = load_server_config(PRIMARY_SERVER)   # now config.php exists
+            db_user = primary_cfg['db_user']
+            db_pass = primary_cfg['db_pass']
             if verbose:
-                print_verbose(f"config.php in place: {cfg_target}")
+                print_verbose(
+                    f"Re-read config.php: db={primary_cfg['db_name']}, "
+                    f"data={primary_cfg['data_dir']}, user={db_user or '(none)'}"
+                )
         else:
             print_warning(f"config.php not found at {cfg_target} after restore — using config.json values only.")
 
@@ -1599,7 +1606,7 @@ def restore(restore_location, verbose):
 
         # ========== SECONDARY (EXAM) SERVER RESTORE ==========
         exam_info = SERVERS[SECONDARY_SERVER]
-        exam_cfg = load_server_config(SECONDARY_SERVER)
+        exam_cfg = load_server_config(SECONDARY_SERVER, require_config_file=False)
         server_backup_exam = os.path.join(temp_dir, SECONDARY_SERVER)
         if not os.path.isdir(server_backup_exam):
             print_warning(f"Exam server backup not found, will try to clone from primary and restore config from backup if available.")
@@ -1646,21 +1653,19 @@ def restore(restore_location, verbose):
             else:
                 print_warning("Exam web backup not found, skipping.")
 
-        # Exam config: read credentials from the config.php that came with
-        # the cloned web root (or was already in place). No separate backup.
+        # Exam config: re-load from the (cloned or pre-existing) config.php
+        # so data_dir / db_* reflect the exam instance, not the primary.
         exam_config_target = exam_cfg['config_file']
         db_user_exam = db_pass_exam = None
         if os.path.isfile(exam_config_target):
-            actual_dbname = get_dbname_from_config(exam_config_target)
-            if actual_dbname:
-                if verbose:
-                    print_verbose(f"DB name from exam config.php: {actual_dbname} (was {exam_cfg['db_name']})")
-                exam_cfg['db_name'] = actual_dbname
-            else:
-                print_warning(f"Could not parse dbname from {exam_config_target}; using config.json value: {exam_cfg['db_name']}")
-            db_user_exam, db_pass_exam = get_dbuser_pass_from_config(exam_config_target)
+            exam_cfg = load_server_config(SECONDARY_SERVER)
+            db_user_exam = exam_cfg['db_user']
+            db_pass_exam = exam_cfg['db_pass']
             if verbose:
-                print_verbose(f"Exam config.php in place: {exam_config_target}")
+                print_verbose(
+                    f"Re-read exam config.php: db={exam_cfg['db_name']}, "
+                    f"data={exam_cfg['data_dir']}, user={db_user_exam or '(none)'}"
+                )
         else:
             print_warning(f"config.php not found at {exam_config_target} after exam restore — using config.json values only.")
 
