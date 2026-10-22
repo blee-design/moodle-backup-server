@@ -73,47 +73,118 @@ import time
 import threading
 import itertools
 import re
+import json
 
 PHP_BIN = 'php'
 
 # ----------------------------------------------------------------------
-# CONFIGURATION – CHANGE THESE VARIABLES TO MATCH YOUR SETUP
+# CONFIGURATION – loaded from ~/moodle_ninja_config.json
+# Auto-created on first run. Nothing is hardcoded any more.
+# DB credentials are NEVER stored here – they are read from Moodle's
+# config.php at runtime (or prompted once).
 # ----------------------------------------------------------------------
+CONFIG_FILE_NAME = '.moodle_ninja_config.json'
 
-PRIMARY_SERVER = 'psc'          # primary server key
-SECONDARY_SERVER = 'exam'       # secondary server key
-WEB_PARENT = '/var/www/html'
-
-SERVERS = {
-    'psc': {
-        'config_file': '/var/www/html/psc-Server/config.php',   # still hardcoded – we'll make it configurable later
-        'symlink_name': 'psc',
-        'symlink_target': 'psc-Server/public',
-    },
-    'exam': {
-        'config_file': '/var/www/html/exam-Server/config.php',
-        'symlink_name': 'exam',
-        'symlink_target': 'exam-Server/public',
+DEFAULT_CONFIG = {
+    "version": 1,
+    "php_bin": "php",
+    "web_parent": "/var/www/html",
+    "db_charset": "utf8mb4",
+    "db_collation": "utf8mb4_unicode_ci",
+    "writable_dirs": [
+        "temp", "cache", "sessions", "localcache", "repository",
+        "theme", "environment", "filter", "calendar", "muc", "lang", "rss", "search"
+    ],
+    "primary_server": "psc",
+    "secondary_server": "exam",
+    "servers": {
+        "psc": {
+            "config_file": "/var/www/html/psc-Server/config.php",
+            "symlink_name": "psc",
+            "symlink_target": "psc-Server/public"
+        },
+        "exam": {
+            "config_file": "/var/www/html/exam-Server/config.php",
+            "symlink_name": "exam",
+            "symlink_target": "exam-Server/public"
+        }
     }
 }
 
-# You can override these with environment variables
-CONFIG_PATHS = {
-    'psc': os.environ.get('PSC_CONFIG', '/var/www/html/psc-Server/config.php'),
-    'exam': os.environ.get('EXAM_CONFIG', '/var/www/html/exam-Server/config.php'),
-}
+def get_config_path():
+    """Return the path to config.json in the *invoking* user's home (sudo-aware)."""
+    original_user = os.environ.get('SUDO_USER')
+    if original_user:
+        try:
+            home = pwd.getpwnam(original_user).pw_dir
+        except KeyError:
+            home = os.path.expanduser(f"~{original_user}")
+    else:
+        home = os.path.expanduser("~")
+    return os.path.join(home, CONFIG_FILE_NAME)
 
-# Database character set and collation for new Moodle databases
-# Moodle strongly recommends utf8mb4 and utf8mb4_unicode_ci
-DB_CHARSET = 'utf8mb4'
-DB_COLLATION = 'utf8mb4_unicode_ci'
+def save_config(cfg):
+    """Atomically write config.json and chown back to SUDO_USER if present."""
+    path = get_config_path()
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, path)
+    if os.environ.get('SUDO_USER'):
+        try:
+            u = pwd.getpwnam(os.environ['SUDO_USER'])
+            os.chown(path, u.pw_uid, u.pw_gid)
+        except (KeyError, PermissionError):
+            pass
+    return path
 
-# List of subdirectories inside the web root that Moodle needs to write to
-# These will be owned by www-data:www-data
-WRITABLE_DIRS = [
-    'temp', 'cache', 'sessions', 'localcache', 'repository',
-    'theme', 'environment', 'filter', 'calendar', 'muc', 'lang', 'rss', 'search'
-]
+def _deep_merge(base, override):
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+
+def load_config():
+    """Load config.json, creating a default if missing. Unknown keys are merged."""
+    path = get_config_path()
+
+    # One-time migration: old non-hidden file -> new hidden file
+    if not os.path.exists(path):
+        legacy = os.path.join(os.path.dirname(path), 'moodle_ninja_config.json')
+        if os.path.exists(legacy):
+            try:
+                os.replace(legacy, path)
+                print(f"[CONFIG] Migrated legacy config -> {path}")
+            except OSError as e:
+                print_warning(f"Could not migrate {legacy}: {e}")
+
+    if not os.path.exists(path):
+        print(f"[CONFIG] First run – creating default config at {path}")
+        save_config(DEFAULT_CONFIG)
+        return json.loads(json.dumps(DEFAULT_CONFIG))
+    try:
+        with open(path, 'r') as f:
+            user_cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"[CONFIG] ERROR: {path} is not valid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+    merged = json.loads(json.dumps(DEFAULT_CONFIG))
+    _deep_merge(merged, user_cfg)
+    return merged
+
+# ---- Load the config and expose module-level names (so the rest of the file
+# ---- keeps working unchanged) ----
+CONFIG            = load_config()
+PHP_BIN           = CONFIG.get('php_bin', 'php')
+PRIMARY_SERVER    = CONFIG['primary_server']
+SECONDARY_SERVER  = CONFIG['secondary_server']
+WEB_PARENT        = CONFIG['web_parent']
+DB_CHARSET        = CONFIG['db_charset']
+DB_COLLATION      = CONFIG['db_collation']
+WRITABLE_DIRS     = CONFIG['writable_dirs']
+SERVERS           = CONFIG['servers']
+CONFIG_PATHS      = {k: v['config_file'] for k, v in SERVERS.items()}
 
 # ----------------------------------------------------------------------
 # HACKER-STYLE AESTHETICS
@@ -458,7 +529,7 @@ def backup_database(db_name, auth_args, backup_dir, server_name, verbose=False):
     os.makedirs(db_backup_dir, exist_ok=True)
     backup_file = os.path.join(db_backup_dir, f"{db_name}_backup_{timestamp}.sql")
     # Use --default-character-set=utf8mb4 to ensure correct charset in the dump
-    dump_cmd = [get_db_dump()] + auth_args + ['--default-character-set=utf8mb4', db_name]
+    dump_cmd = [get_db_dump()] + auth_args + [f'--default-character-set={DB_CHARSET}', db_name]
     with open(backup_file, 'wb') as f:
         run_cmd(dump_cmd, verbose, stdout=f)
 
@@ -1030,7 +1101,7 @@ def backup(backup_location, verbose):
             print_info("Dumping database...")
             db_dump = os.path.join(server_dir, 'db.sql')
             current_auth = ensure_db_access(server_cfg['db_name'])
-            dump_cmd = [get_db_dump()] + current_auth + ['--default-character-set=utf8mb4', server_cfg['db_name']]
+            dump_cmd = [get_db_dump()] + current_auth + [f'--default-character-set={DB_CHARSET}', server_cfg['db_name']]
 
             stop = spinner("Dumping database...")
             try:
@@ -1198,7 +1269,13 @@ def get_conflict_policy(verbose):
     return policy
 
 def load_server_config(server_name):
-    """Return a dict with all Moodle config values from config.php."""
+    """
+    Merge values from config.json (server entry) with those parsed from the
+    Moodle config.php. Priority:
+        config.json override > config.php > built-in fallback.
+    Credentials (dbuser/dbpass) always come from config.php — never stored in
+    config.json, so the config file stays credential-free.
+    """
     cfg = SERVERS[server_name]
     config_path = cfg['config_file']
     if not os.path.isfile(config_path):
@@ -1207,21 +1284,18 @@ def load_server_config(server_name):
     with open(config_path, 'r') as f:
         content = f.read()
 
-    # Extract variables
     def get_var(name):
         pattern = r'\$CFG->' + re.escape(name) + r'\s*=\s*([\'"])([^\'"]+)\1\s*;'
         m = re.search(pattern, content)
         return m.group(2) if m else None
 
-    dataroot = get_var('dataroot') or '/var/serverData/default'
-    dbname   = get_var('dbname') or server_name
+    web_root = cfg.get('web_root') or os.path.dirname(config_path)
+    dataroot = cfg.get('data_dir') or get_var('dataroot') or f'/var/serverData/{server_name}'
+    dbname   = cfg.get('db_name')  or get_var('dbname')   or server_name
     dbuser   = get_var('dbuser') or ''
     dbpass   = get_var('dbpass') or ''
     prefix   = get_var('prefix') or 'mdl_'
     wwwroot  = get_var('wwwroot') or ''
-
-    # Derive web_root from config file location (the directory containing config.php)
-    web_root = os.path.dirname(config_path)
 
     return {
         'web_root': web_root,
@@ -1390,7 +1464,7 @@ def restore(restore_location, verbose):
             if proceed_with_db:
                 create_database_if_not_exists(primary_cfg['db_name'], auth_args, verbose)
                 client = get_db_client()
-                db_cmd = [client] + auth_args + ['--default-character-set=utf8mb4', primary_cfg['db_name']]
+                db_cmd = [client] + auth_args + [f'--default-character-set={DB_CHARSET}', primary_cfg['db_name']]
                 with open(db_backup, 'rb') as f:
                     run_cmd(db_cmd, verbose, stdin=f)
                 if verbose:
@@ -1529,7 +1603,7 @@ def restore(restore_location, verbose):
             if proceed_with_db:
                 create_database_if_not_exists(exam_cfg['db_name'], auth_args, verbose)
                 client = get_db_client()
-                db_cmd = [client] + auth_args + ['--default-character-set=utf8mb4', exam_cfg['db_name']]
+                db_cmd = [client] + auth_args + [f'--default-character-set={DB_CHARSET}', exam_cfg['db_name']]
                 with open(db_backup_exam, 'rb') as f:
                     run_cmd(db_cmd, verbose, stdin=f)
                 if verbose:
@@ -1737,7 +1811,7 @@ def restore_previous(backup_dir, verbose):
                             if proceed:
                                 create_database_if_not_exists(cfg['db_name'], auth_args, verbose)
                                 client = get_db_client()
-                                db_cmd = [client] + auth_args + ['--default-character-set=utf8mb4', cfg['db_name']]
+                                db_cmd = [client] + auth_args + [f'--default-character-set={DB_CHARSET}', cfg['db_name']]
                                 with open(selected, 'rb') as f:
                                     run_cmd(db_cmd, verbose, stdin=f)
                                 print_info(f"Restored database from {selected}")
@@ -1790,6 +1864,297 @@ def print_summary(operation, start_time, servers, file_counts, db_sizes):
 # ----------------------------------------------------------------------
 # Main CLI
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# MENU SYSTEM (new)
+# ----------------------------------------------------------------------
+def _clear():
+    os.system('clear' if os.name == 'posix' else 'cls')
+
+def _choose_server():
+    keys = list(SERVERS.keys())
+    print("Choose a server:")
+    for i, k in enumerate(keys, 1):
+        marker = " (primary)" if k == PRIMARY_SERVER else (" (secondary)" if k == SECONDARY_SERVER else "")
+        print(f"  {i}. {k}{marker}")
+    print(f"  0. Back")
+    c = print_prompt(f"Choice (1-{len(keys)}, default 1): ").strip() or "1"
+    if c == "0":
+        return None
+    try:
+        return keys[int(c) - 1]
+    except (ValueError, IndexError):
+        print_error("Invalid choice.")
+        return None
+
+def _menu_backup():
+    _clear()
+    print(f"{COLOR_BOLD}== BACKUP =={COLOR_RESET}")
+    print(f"  1. Backup to default location (~/moodle_backup_<timestamp>.tar.xz)")
+    print(f"  2. Backup to a custom location")
+    print(f"  3. Backup with maintenance mode enabled first")
+    print(f"  0. Back")
+    c = print_prompt("Choice: ").strip()
+    if c == "0" or not c:
+        return
+    loc = None
+    maintenance = False
+    if c == "2":
+        loc = print_prompt("Full path for archive: ").strip()
+        if not loc:
+            print_warning("No location given, aborting.")
+            return
+    elif c == "3":
+        maintenance = True
+    try:
+        if maintenance:
+            set_maintenance(PRIMARY_SERVER, enable=True)
+        backup(loc, verbose=False)
+    finally:
+        if maintenance:
+            try:
+                set_maintenance(PRIMARY_SERVER, enable=False)
+            except SystemExit:
+                print_warning("Could not disable maintenance mode — do it manually.")
+
+def _menu_restore():
+    _clear()
+    print(f"{COLOR_BOLD}== RESTORE =={COLOR_RESET}")
+    print(f"  1. Restore from latest backup (auto-detected in home dir)")
+    print(f"  2. Restore from a specific archive path / directory")
+    print(f"  0. Back")
+    c = print_prompt("Choice: ").strip()
+    if c == "0" or not c:
+        return
+
+    loc = None
+    if c == "2":
+        # Compute a sensible default from the invoking user's home directory
+        latest = find_latest_backup()
+        default_hint = latest if latest else os.path.join(
+            get_default_backup_dir(), "moodle_backup_<timestamp>.tar.xz"
+        )
+        raw = print_prompt(
+            f"Path to archive or directory\n"
+            f"   (Enter = use default: {default_hint}\n"
+            f"    type a directory to pick its newest moodle_backup_*.tar.xz)\n"
+            f"❯ "
+        ).strip()
+
+        if not raw:
+            # Empty -> use the auto-detected latest from home
+            if not latest:
+                print_warning(
+                    f"No moodle_backup_*.tar.xz found in "
+                    f"{get_default_backup_dir()} — aborting."
+                )
+                return
+            loc = latest
+            print_info(f"Using latest backup: {loc}")
+        else:
+            expanded = os.path.expanduser(raw)
+            if os.path.isdir(expanded):
+                # Directory given -> find the newest backup inside it
+                files = sorted(
+                    glob.glob(os.path.join(expanded, "moodle_backup_*.tar.xz")),
+                    key=os.path.getmtime,
+                    reverse=True,
+                )
+                if not files:
+                    print_warning(
+                        f"No moodle_backup_*.tar.xz found in {expanded}"
+                    )
+                    return
+                loc = files[0]
+                print_info(f"Using newest backup in directory: {loc}")
+            else:
+                loc = expanded
+
+    # For choice 1, loc stays None -> restore() auto-detects + confirms
+    restore(loc, verbose=False)
+
+def _menu_update():
+    _clear()
+    srv = _choose_server()
+    if not srv:
+        return
+    branch = print_prompt("Branch (leave blank for current): ").strip() or None
+    maint = print_prompt("Enable maintenance mode during update? (Y/n): ").strip().lower()
+    enable_maint = maint not in ("n", "no")
+    update_moodle(srv, branch=branch, enable_maintenance=enable_maint, verbose=False)
+
+def _menu_upgrade():
+    _clear()
+    srv = _choose_server()
+    if not srv:
+        return
+    chk = print_prompt("Only check, do not run upgrade? (y/N): ").strip().lower()
+    check_only = chk in ("y", "yes")
+    upgrade_moodle(srv, check_only=check_only, verbose=False)
+
+def _with_db_auth(fn):
+    """Obtain DB admin creds once, run fn(auth_args), clean up temp file."""
+    auth_args, temp_file = obtain_db_credentials(False)
+    try:
+        return fn(auth_args)
+    finally:
+        if temp_file and os.path.exists(temp_file):
+            os.unlink(temp_file)
+
+def _menu_maintenance():
+    _clear()
+    srv = _choose_server()
+    if not srv:
+        return
+    print(f"  1. Enable")
+    print(f"  2. Disable")
+    print(f"  3. Status")
+    print(f"  4. Custom message")
+    print(f"  0. Back")
+    c = print_prompt("Choice: ").strip()
+    if c == "0" or not c:
+        return
+
+    def do(auth):
+        if c == "1":
+            allow = print_prompt("Allow admins to log in? (Y/n): ").strip().lower() not in ("n", "no")
+            set_config_value(srv, 'maintenance_enabled', True, auth)
+            set_config_value(srv, 'maintenance_allow_admins', allow, auth)
+            print_success("Maintenance enabled.")
+        elif c == "2":
+            set_config_value(srv, 'maintenance_enabled', False, auth)
+            print_success("Maintenance disabled.")
+        elif c == "3":
+            settings = get_maintenance_settings(srv, auth)
+            print(json.dumps(settings, indent=2))
+        elif c == "4":
+            msg = print_prompt("Custom message: ").strip()
+            if msg:
+                set_config_value(srv, 'maintenance_message', msg, auth)
+                print_success("Message set.")
+    _with_db_auth(do)
+
+def _menu_cron():
+    _clear()
+    srv = _choose_server()
+    if not srv:
+        return
+    print(f"  1. Run cron now")
+    print(f"  2. Install / update crontab entry")
+    print(f"  0. Back")
+    c = print_prompt("Choice: ").strip()
+    if c == "0" or not c:
+        return
+    if c == "1":
+        run_cron(srv)
+    elif c == "2":
+        sched = print_prompt("Schedule (default '* * * * *'): ").strip() or "* * * * *"
+        setup_cron_job(srv, sched, verbose=False)
+
+def _menu_status():
+    _clear()
+    srv = _choose_server()
+    if not srv:
+        return
+    show_status(srv)
+
+def _menu_config():
+    _clear()
+    print(f"{COLOR_BOLD}== CONFIG MANAGEMENT =={COLOR_RESET}")
+    print(f"  File: {get_config_path()}")
+    print(f"  1. View current config")
+    print(f"  2. Edit a value (dot-path, e.g. servers.psc.config_file)")
+    print(f"  3. Reset to defaults (destructive)")
+    print(f"  4. Show file path")
+    print(f"  5. Recreate file if missing")
+    print(f"  0. Back")
+    c = print_prompt("Choice: ").strip()
+    if c == "1":
+        print(json.dumps(CONFIG, indent=2))
+    elif c == "2":
+        print("Current config:")
+        print(json.dumps(CONFIG, indent=2))
+        path = print_prompt("Dot-path to edit: ").strip()
+        if not path:
+            return
+        keys = path.split(".")
+        node = CONFIG
+        for k in keys[:-1]:
+            if isinstance(node, dict) and k in node:
+                node = node[k]
+            else:
+                print_error(f"Invalid path: {path}")
+                return
+        last = keys[-1]
+        if not (isinstance(node, dict) and last in node):
+            print_error(f"Key not found: {path}")
+            return
+        cur = node[last]
+        raw = print_prompt(f"New value (current: {cur!r}): ").strip()
+        try:
+            new_val = json.loads(raw)
+        except json.JSONDecodeError:
+            new_val = raw
+        node[last] = new_val
+        save_config(CONFIG)
+        print_success(f"Updated {path} = {new_val!r}")
+        print_warning("Restart the script for module-level changes to take effect.")
+    elif c == "3":
+        if print_prompt("Really reset to defaults? (y/N): ").strip().lower() in ("y", "yes"):
+            save_config(DEFAULT_CONFIG)
+            print_success("Config reset. Restart the script.")
+    elif c == "4":
+        print(get_config_path())
+    elif c == "5":
+        if os.path.exists(get_config_path()):
+            print_warning("File already exists.")
+        else:
+            save_config(DEFAULT_CONFIG)
+            print_success(f"Created {get_config_path()}")
+
+def run_menu():
+    _clear()
+    print(f"{COLOR_BOLD}{COLOR_MAGENTA} MOODLE NINJA – MAIN MENU {COLOR_RESET}")
+    while True:
+        print()
+        print(f"  {COLOR_CYAN}1{COLOR_RESET}. Backup")
+        print(f"  {COLOR_CYAN}2{COLOR_RESET}. Restore")
+        print(f"  {COLOR_CYAN}3{COLOR_RESET}. Restore previous (from /tmp restore dirs)")
+        print(f"  {COLOR_CYAN}4{COLOR_RESET}. Update code + DB upgrade (git)")
+        print(f"  {COLOR_CYAN}5{COLOR_RESET}. Upgrade (DB only)")
+        print(f"  {COLOR_CYAN}6{COLOR_RESET}. Maintenance mode")
+        print(f"  {COLOR_CYAN}7{COLOR_RESET}. Cron")
+        print(f"  {COLOR_CYAN}8{COLOR_RESET}. Status")
+        print(f"  {COLOR_CYAN}9{COLOR_RESET}. Config management")
+        print(f"  {COLOR_CYAN}0{COLOR_RESET}. Exit")
+        c = print_prompt("Choice: ").strip()
+        try:
+            if   c == "1": _menu_backup()
+            elif c == "2": _menu_restore()
+            elif c == "3":
+                rp_parser = argparse.Namespace(backup_dir=None, verbose=False)
+                restore_previous(None, False)
+            elif c == "4": _menu_update()
+            elif c == "5": _menu_upgrade()
+            elif c == "6": _menu_maintenance()
+            elif c == "7": _menu_cron()
+            elif c == "8": _menu_status()
+            elif c == "9": _menu_config()
+            elif c in ("0", "q", "quit", "exit"):
+                print_success("Bye.")
+                return
+            else:
+                print_warning("Invalid choice.")
+        except KeyboardInterrupt:
+            print("\nAborted.")
+            return
+        except SystemExit:
+            raise
+        except Exception as e:
+            print_error(f"Unexpected error: {e}")
+
+# ----------------------------------------------------------------------
+# Original CLI entry point (kept for scripting / cron)
+# ----------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
         description="Backup, restore, upgrade, and manage Moodle servers (primary and exam)."
@@ -1797,86 +2162,66 @@ def main():
     subparsers = parser.add_subparsers(dest='command', required=True, help='Subcommands')
 
     backup_parser = subparsers.add_parser('backup', help='Create a backup')
-    backup_parser.add_argument('-l', '--backup-location',
-                               help='Full path where the backup archive will be saved '
-                                    '(default: ~/moodle_backup_<timestamp>.tar.xz in the invoking user\'s home)')
-    backup_parser.add_argument('-v', '--verbose', action='store_true',
-                               help='Print detailed progress')
+    backup_parser.add_argument('-l', '--backup-location', help='Full path where the backup archive will be saved')
+    backup_parser.add_argument('--maintenance', action='store_true', help='Enable maintenance mode before backup')
+    backup_parser.add_argument('-v', '--verbose', action='store_true')
 
     restore_parser = subparsers.add_parser('restore', help='Restore from a backup archive')
-    restore_parser.add_argument('-r', '--restore-location',
-                                help='Full path to the backup archive to restore. '
-                                     'If omitted, the script will look for the most recent backup '
-                                     'in the default backup directory and ask for confirmation.')
-    restore_parser.add_argument('-v', '--verbose', action='store_true',
-                                help='Print detailed progress')
+    restore_parser.add_argument('-r', '--restore-location', help='Full path to the backup archive to restore')
+    restore_parser.add_argument('--maintenance', action='store_true', help='Enable maintenance mode before restore')
+    restore_parser.add_argument('-v', '--verbose', action='store_true')
 
-        # --- NEW: upgrade parser ---
     upgrade_parser = subparsers.add_parser('upgrade', help='Upgrade Moodle')
-    upgrade_parser.add_argument('--server', choices=SERVERS.keys(), default=PRIMARY_SERVER,
-                                help='Which server to upgrade (default: primary)')
-    upgrade_parser.add_argument('--check', action='store_true',
-                                help='Only check if upgrade is needed, do not perform')
+    upgrade_parser.add_argument('--server', choices=SERVERS.keys(), default=PRIMARY_SERVER)
+    upgrade_parser.add_argument('--check', action='store_true')
     upgrade_parser.add_argument('-v', '--verbose', action='store_true')
 
-    # --- NEW: maintenance parser ---
     maint_parser = subparsers.add_parser('maintenance', help='Manage maintenance mode')
-    maint_parser.add_argument('--enable', action='store_true', help='Enable maintenance mode')
-    maint_parser.add_argument('--disable', action='store_true', help='Disable maintenance mode')
-    maint_parser.add_argument('--status', action='store_true', help='Show current maintenance status')
-    maint_parser.add_argument('--allow-admins', dest='no_admins', action='store_false',
-                              help='Allow admins to log in (default)')
-    maint_parser.add_argument('--no-admins', dest='no_admins', action='store_true',
-                              help='Block even admins')
-    maint_parser.add_argument('--message', help='Custom maintenance message')
+    maint_parser.add_argument('--enable', action='store_true')
+    maint_parser.add_argument('--disable', action='store_true')
+    maint_parser.add_argument('--status', action='store_true')
+    maint_parser.add_argument('--allow-admins', dest='no_admins', action='store_false')
+    maint_parser.add_argument('--no-admins', dest='no_admins', action='store_true')
+    maint_parser.add_argument('--message')
     maint_parser.add_argument('--server', choices=SERVERS.keys(), default=PRIMARY_SERVER)
     maint_parser.add_argument('-v', '--verbose', action='store_true')
 
-    # --- NEW: cron parser ---
     cron_parser = subparsers.add_parser('cron', help='Run Moodle cron')
     cron_parser.add_argument('--server', choices=SERVERS.keys(), default=PRIMARY_SERVER)
-    cron_parser.add_argument('--setup', help='Add cron to system crontab (e.g., "* * * * *")',
-                             nargs='?', const='* * * * *')
+    cron_parser.add_argument('--setup', nargs='?', const='* * * * *')
     cron_parser.add_argument('-v', '--verbose', action='store_true')
 
-    # --- NEW: status parser ---
     status_parser = subparsers.add_parser('status', help='Show Moodle status')
     status_parser.add_argument('--server', choices=SERVERS.keys(), default=PRIMARY_SERVER)
     status_parser.add_argument('-v', '--verbose', action='store_true')
 
-    rp_parser = subparsers.add_parser('restore-previous', aliases=['rp'],
-                                       help='Restore from a previous backup directory (created during a restore)')
-    rp_parser.add_argument('-d', '--backup-dir',
-                           help='Path to the backup directory (default: the most recent in /tmp)')
-    rp_parser.add_argument('-v', '--verbose', action='store_true',
-                           help='Print detailed progress')
+    rp_parser = subparsers.add_parser('restore-previous', aliases=['rp'])
+    rp_parser.add_argument('-d', '--backup-dir')
+    rp_parser.add_argument('-v', '--verbose', action='store_true')
 
-    backup_parser.add_argument('--maintenance', action='store_true',
-                            help='Enable maintenance mode before backup and disable afterwards')
-    restore_parser.add_argument('--maintenance', action='store_true',
-                            help='Enable maintenance mode before restore and disable afterwards')
+    update_parser = subparsers.add_parser('update', help='Update Moodle code from git and run DB upgrade')
+    update_parser.add_argument('--server', choices=SERVERS.keys(), default=PRIMARY_SERVER)
+    update_parser.add_argument('--branch')
+    update_parser.add_argument('--no-maintenance', action='store_true')
+    update_parser.add_argument('-v', '--verbose', action='store_true')
 
-    # --- NEW: update parser (git + php upgrade) ---
-    update_parser = subparsers.add_parser(
-        'update',
-        help='Update Moodle code from git (shallow-aware) and run the DB upgrade'
-    )
-    update_parser.add_argument('--server', choices=SERVERS.keys(),
-                               default=PRIMARY_SERVER,
-                               help='Which server to update (default: primary)')
-    update_parser.add_argument('--branch',
-                               help='Git branch to update from (default: currently checked-out branch)')
-    update_parser.add_argument('--no-maintenance', action='store_true',
-                               help='Do not toggle maintenance mode during the update')
-    update_parser.add_argument('-v', '--verbose', action='store_true',
-                               help='Print detailed progress')
+    # config management for CLI too
+    cfg_parser = subparsers.add_parser('config', help='Manage config.json')
+    cfg_parser.add_argument('--show', action='store_true', help='Print current config')
+    cfg_parser.add_argument('--path', action='store_true', help='Print config file path')
+    cfg_parser.add_argument('--reset', action='store_true', help='Reset to defaults')
 
     args = parser.parse_args()
-    if args.verbose:
-        global _USE_COLOR
-        _USE_COLOR = True
 
-    matrix_intro()
+    if args.command == 'config':
+        if args.path:
+            print(get_config_path())
+        elif args.reset:
+            save_config(DEFAULT_CONFIG)
+            print_success("Config reset.")
+        else:
+            print(json.dumps(CONFIG, indent=2))
+        return
 
     if args.command == 'backup':
         backup(args.backup_location, args.verbose)
@@ -1884,16 +2229,13 @@ def main():
         restore(args.restore_location, args.verbose)
     elif args.command in ('restore-previous', 'rp'):
         restore_previous(args.backup_dir, args.verbose)
-    # --- NEW handlers ---
     elif args.command == 'upgrade':
         upgrade_moodle(args.server, args.check, args.verbose)
     elif args.command == 'maintenance':
-        # Database credentials needed
         auth_args, temp_auth_file = obtain_db_credentials(args.verbose)
         try:
             if args.status:
-                settings = get_maintenance_settings(args.server, auth_args, args.verbose)
-                # ... print status
+                print(json.dumps(get_maintenance_settings(args.server, auth_args, args.verbose), indent=2))
             elif args.enable:
                 set_config_value(args.server, 'maintenance_enabled', 1, auth_args, args.verbose)
                 allow = not getattr(args, 'no_admins', False)
@@ -1904,8 +2246,6 @@ def main():
             elif args.disable:
                 set_config_value(args.server, 'maintenance_enabled', 0, auth_args, args.verbose)
                 print_success("Maintenance mode disabled.")
-            else:
-                print_warning("Please specify --enable, --disable, or --status")
         finally:
             if temp_auth_file and os.path.exists(temp_auth_file):
                 os.unlink(temp_auth_file)
@@ -1916,14 +2256,9 @@ def main():
             run_cron(args.server, args.verbose)
     elif args.command == 'status':
         show_status(args.server, args.verbose)
-
     elif args.command == 'update':
-        update_moodle(
-            args.server,
-            branch=args.branch,
-            enable_maintenance=not args.no_maintenance,
-            verbose=args.verbose,
-        )
+        update_moodle(args.server, branch=args.branch,
+                      enable_maintenance=not args.no_maintenance, verbose=args.verbose)
     else:
         parser.print_help()
         sys.exit(1)
@@ -1932,4 +2267,12 @@ if __name__ == '__main__':
     if os.geteuid() != 0:
         print_error("This script must be run as root (sudo).")
         sys.exit(1)
-    main()
+
+    if len(sys.argv) == 1:
+        # No arguments → interactive menu (the default experience)
+        matrix_intro()
+        run_menu()
+    else:
+        # Arguments given → classic CLI mode (for cron / scripting)
+        matrix_intro()
+        main()
