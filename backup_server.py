@@ -1042,6 +1042,153 @@ def fix_permissions(server_name, cfg, verbose):
         print_warning(f"Data directory {data_dir} does not exist, cannot set permissions.")
 
 # ----------------------------------------------------------------------
+# Archive helpers — cinematic tar with system-style progress
+# ----------------------------------------------------------------------
+def _human_size(num_bytes):
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if abs(num_bytes) < 1024.0:
+            return f"{num_bytes:.2f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.2f} PiB"
+
+def _human_time(seconds):
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, s = divmod(int(seconds), 60)
+    if m < 60:
+        return f"{m}m{s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m}m{s}s"
+
+def _scan_tree(path):
+    """Return (raw_bytes, file_count, dir_count) for path."""
+    total = files_n = dirs_n = 0
+    for root, dirs, files in os.walk(path):
+        dirs_n += len(dirs)
+        files_n += len(files)
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total, files_n, dirs_n
+
+def _count_tar_members(archive_path):
+    """Fast member count via tar -tf (no extraction)."""
+    r = subprocess.run(['tar', '-tf', archive_path], capture_output=True, text=True)
+    return len(r.stdout.splitlines()) if r.returncode == 0 else 0
+
+def create_archive(source_dir, archive_path, verbose=False):
+    """
+    Create .tar.xz from source_dir with the same visual language as the rest
+    of the script: spinner (non-verbose), live progress bar (verbose), and a
+    final size/ratio/timing summary.
+    """
+    raw_bytes, files_n, dirs_n = _scan_tree(source_dir)
+    total_members = files_n + dirs_n
+    print_info(
+        f"Compressing payload: {files_n} files, {dirs_n} dirs, "
+        f"{_human_size(raw_bytes)} raw → {os.path.basename(archive_path)}"
+    )
+    start = time.time()
+
+    if verbose:
+        cmd = ['tar', '-C', source_dir, '-cJvf', archive_path, '.']
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        n = 0
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            n += 1
+            if total_members and (n % 50 == 0 or n == total_members):
+                suffix = os.path.basename(line.strip())[:40]
+                print_progress_bar(n, total_members,
+                                   prefix='Compress:', suffix=suffix, length=40)
+        proc.wait()
+        if proc.returncode != 0:
+            print_error("tar exited with an error during compression.")
+            sys.exit(1)
+    else:
+        cmd = ['tar', '-C', source_dir, '-cJf', archive_path, '.']
+        stop = spinner(f"Compressing {total_members} entries ({_human_size(raw_bytes)})")
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            stop()
+            print_error(f"Compression failed: {e}")
+            if e.stderr:
+                print_error(e.stderr.decode(errors='replace'))
+            sys.exit(1)
+        stop()
+
+    elapsed = time.time() - start
+    if not os.path.isfile(archive_path):
+        print_error(f"Archive missing after compression: {archive_path}")
+        sys.exit(1)
+    out_bytes = os.path.getsize(archive_path)
+    ratio = (out_bytes / raw_bytes * 100.0) if raw_bytes else 0.0
+    print_success(
+        f"Archive ready: {archive_path} — {_human_size(out_bytes)} "
+        f"({ratio:.1f}% of raw), {_human_time(elapsed)}"
+    )
+
+def extract_archive(archive_path, target_dir, verbose=False):
+    """
+    Extract .tar.xz into target_dir with progress + summary, matching the
+    system's usual output style.
+    """
+    if not os.path.isfile(archive_path):
+        print_error(f"Archive not found: {archive_path}")
+        sys.exit(1)
+    total = _count_tar_members(archive_path)
+    archive_size = os.path.getsize(archive_path)
+    print_info(
+        f"Extracting archive: {_human_size(archive_size)}, {total} entries "
+        f"→ {target_dir}"
+    )
+    start = time.time()
+
+    if verbose:
+        cmd = ['tar', '-C', target_dir, '-xJvf', archive_path]
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        n = 0
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            n += 1
+            if total:
+                suffix = os.path.basename(line.strip())[:40]
+                print_progress_bar(n, total,
+                                   prefix='Extract:', suffix=suffix, length=40)
+        proc.wait()
+        if proc.returncode != 0:
+            print_error("tar exited with an error during extraction.")
+            sys.exit(1)
+    else:
+        cmd = ['tar', '-C', target_dir, '-xJf', archive_path]
+        stop = spinner(f"Extracting {total} entries")
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            stop()
+            print_error(f"Extraction failed: {e}")
+            if e.stderr:
+                print_error(e.stderr.decode(errors='replace'))
+            sys.exit(1)
+        stop()
+
+    elapsed = time.time() - start
+    landed = sum(len(f) for _, _, f in os.walk(target_dir))
+    print_success(
+        f"Extraction complete: {landed} files restored into {target_dir} "
+        f"in {_human_time(elapsed)}"
+    )
+
+# ----------------------------------------------------------------------
 # Backup
 # ----------------------------------------------------------------------
 def backup(backup_location, verbose):
@@ -1153,12 +1300,8 @@ def backup(backup_location, verbose):
             archive_name = backup_location
         else:
             archive_name = get_default_backup_path()
-        print_info("Compressing payload...")
-        if verbose:
-            run_cmd_stream(['tar', '-C', temp_dir, '-cJvf', archive_name, '.'], verbose)
-        else:
-            run_cmd(['tar', '-C', temp_dir, '-cJf', archive_name, '.'], verbose)
-        print_success(f"Backup successfully created: {archive_name}")
+        print_verbose("All servers harvested; sealing payload.", component='tar')
+        create_archive(temp_dir, archive_name, verbose)
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1363,12 +1506,7 @@ def restore(restore_location, verbose):
         return auth_args
 
     try:
-        if verbose:
-            run_cmd_stream(['tar', '-C', temp_dir, '-xJvf', restore_location], verbose)
-        else:
-            run_cmd(['tar', '-C', temp_dir, '-xJf', restore_location], verbose)
-        if verbose:
-            print_verbose("Extraction complete.")
+        extract_archive(restore_location, temp_dir, verbose)
 
         ensure_server_access()
         policy = get_conflict_policy(verbose)
