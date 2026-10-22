@@ -623,14 +623,26 @@ def get_maintenance_settings(server_name, auth_args, verbose=False):
 # ----------------------------------------------------------------------
 def _parse_config_var(content, var_name):
     """
-    Helper to parse a variable like $CFG->dbname from PHP config content.
+    Parse $CFG->var_name from PHP config. Handles both forms:
+        $CFG->dbname = 'psc';          (literal)
+        $CFG->dbname = $app_name;      (variable reference, resolved from
+                                        $app_name = 'psc'; above)
     Returns the value or None.
     """
-    # Build regex: allow spaces, single/double quotes, and optional semicolon
+    # 1. Literal assignment
     pattern = r'\$CFG->' + re.escape(var_name) + r'\s*=\s*([\'"])([^\'"]+)\1\s*;'
-    match = re.search(pattern, content)
-    if match:
-        return match.group(2)
+    m = re.search(pattern, content)
+    if m:
+        return m.group(2)
+    # 2. Variable reference: $CFG->dbname = $app_name;
+    pattern_var = r'\$CFG->' + re.escape(var_name) + r'\s*=\s*\$([A-Za-z_][A-Za-z0-9_]*)\s*;'
+    m = re.search(pattern_var, content)
+    if m:
+        ref = m.group(1)
+        ref_pattern = r'\$' + re.escape(ref) + r'\s*=\s*([\'"])([^\'"]+)\1\s*;'
+        ref_m = re.search(ref_pattern, content)
+        if ref_m:
+            return ref_m.group(2)
     return None
 
 def get_dbname_from_config(config_path):
@@ -1232,9 +1244,21 @@ def backup(backup_location, verbose):
             server_dir = os.path.join(temp_dir, server_name)
             os.makedirs(server_dir, exist_ok=True)
 
-            # Config file lives inside the web root — it comes with the
-            # `html/` copy below, so no separate capture is needed.
-
+            # Primary's config.php comes for free inside html/. Exam's web
+            # root is NOT backed up (it is cloned from primary on restore),
+            # so exam's own config.php must be captured explicitly — otherwise
+            # the clone would leave exam pointing at primary's DB/user/dataroot.
+            if server_name == SECONDARY_SERVER:
+                cfg_src = server_cfg['config_file']
+                cfg_dst = os.path.join(server_dir, f"config-{server_name}.php")
+                if os.path.exists(cfg_src):
+                    run_cmd(['cp', '-a', cfg_src, cfg_dst], verbose)
+                    if verbose:
+                        print_verbose(f"Exam config captured: {cfg_src} -> {cfg_dst}")
+                    else:
+                        print_info("Exam-specific config.php captured.")
+                else:
+                    print_warning(f"Exam config {cfg_src} not found — exam restore will not be able to recover DB settings.")
             # Database dump – use server_cfg
             print_info("Dumping database...")
             db_dump = os.path.join(server_dir, 'db.sql')
@@ -1653,21 +1677,38 @@ def restore(restore_location, verbose):
             else:
                 print_warning("Exam web backup not found, skipping.")
 
-        # Exam config: re-load from the (cloned or pre-existing) config.php
-        # so data_dir / db_* reflect the exam instance, not the primary.
+        # Exam's web root was cloned from primary, so its config.php currently
+        # points at primary's DB / user / dataroot. Overwrite it with exam's
+        # own config.php captured during backup, THEN re-read everything.
         exam_config_target = exam_cfg['config_file']
+        cfg_backup_exam = os.path.join(server_backup_exam, f"config-{SECONDARY_SERVER}.php")
         db_user_exam = db_pass_exam = None
-        if os.path.isfile(exam_config_target):
+        if os.path.isfile(cfg_backup_exam):
+            os.makedirs(os.path.dirname(exam_config_target), exist_ok=True)
+            if os.path.isfile(exam_config_target):
+                backup_existing(SECONDARY_SERVER, 'config',
+                                exam_config_target, backup_root, verbose)
+            shutil.copy2(cfg_backup_exam, exam_config_target)
+            print_info("Restored exam's own config.php (overwrote cloned primary config).")
             exam_cfg = load_server_config(SECONDARY_SERVER)
             db_user_exam = exam_cfg['db_user']
             db_pass_exam = exam_cfg['db_pass']
             if verbose:
                 print_verbose(
-                    f"Re-read exam config.php: db={exam_cfg['db_name']}, "
+                    f"Exam config loaded: db={exam_cfg['db_name']}, "
                     f"data={exam_cfg['data_dir']}, user={db_user_exam or '(none)'}"
                 )
+        elif os.path.isfile(exam_config_target):
+            exam_cfg = load_server_config(SECONDARY_SERVER)
+            db_user_exam = exam_cfg['db_user']
+            db_pass_exam = exam_cfg['db_pass']
+            print_warning("No exam config backup found; using config.php already in place "
+                          "(may still point at primary — verify manually).")
         else:
-            print_warning(f"config.php not found at {exam_config_target} after exam restore — using config.json values only.")
+            print_warning(
+                f"Exam config missing ({cfg_backup_exam}, {exam_config_target}). "
+                "Exam DB restore will use config.json values only — this will likely fail."
+            )
 
         # Exam data directory
         data_backup_exam = os.path.join(server_backup_exam, 'data')
