@@ -798,21 +798,291 @@ def get_moodle_version(server_name):
     release = release_match.group(1) if release_match else None
     return branch, release
 
-def get_current_branch(web_root):
-    """Return the currently checked-out branch, or None."""
-    result = subprocess.run(
-        ['git', '-C', web_root, 'rev-parse', '--abbrev-ref', 'HEAD'],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        return None
-    branch = result.stdout.strip()
-    return None if branch in ('', 'HEAD') else branch
+def get_repo_state(web_root):
+    """
+    Gather all git facts we need in one shot — avoids 6 separate subprocess
+    calls scattered around and gives us a single source of truth for decisions.
+    """
+    state = {
+        'branch': None,        # e.g. 'MOODLE_502_STABLE'
+        'upstream': None,      # e.g. 'origin/MOODLE_502_STABLE'
+        'head_sha': None,      # full SHA
+        'head_short': None,    # 7-char
+        'shallow': False,
+        'detached': False,
+        'dirty': False,        # tracked files with local mods
+        'has_origin': False,
+    }
 
-def is_shallow_clone(web_root):
-    return os.path.exists(os.path.join(web_root, '.git', 'shallow'))
+    def git(*args):
+        return subprocess.run(
+            ['git', '-C', web_root] + list(args),
+            capture_output=True, text=True,
+        )
+
+    # HEAD sha
+    r = git('rev-parse', 'HEAD')
+    if r.returncode == 0:
+        state['head_sha'] = r.stdout.strip()
+        state['head_short'] = state['head_sha'][:7]
+
+    # Branch (or detached) — symbolic-ref fails on detached HEAD
+    r = git('symbolic-ref', '--short', '-q', 'HEAD')
+    if r.returncode == 0 and r.stdout.strip():
+        state['branch'] = r.stdout.strip()
+    else:
+        state['detached'] = True
+        # Infer branch from origin/* refs that contain HEAD
+        r = git('branch', '-r', '--contains', 'HEAD')
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                line = line.strip().lstrip('* ').strip()
+                if line.startswith('origin/') and 'HEAD' not in line:
+                    state['branch'] = line[len('origin/'):]
+                    break
+
+    # Upstream tracking
+    if state['branch']:
+        r = git('rev-parse', '--abbrev-ref', f'{state["branch"]}@{{upstream}}')
+        if r.returncode == 0:
+            state['upstream'] = r.stdout.strip()
+
+    # Shallow — prefer git's own answer, fall back to file check
+    r = git('rev-parse', '--is-shallow-repository')
+    if r.returncode == 0:
+        state['shallow'] = r.stdout.strip() == 'true'
+    else:
+        state['shallow'] = os.path.exists(os.path.join(web_root, '.git', 'shallow'))
+
+    # Dirty (tracked files only — untracked stuff like config.php is preserved anyway)
+    r = git('status', '--porcelain', '--untracked-files=no')
+    if r.returncode == 0:
+        state['dirty'] = bool(r.stdout.strip())
+
+    # Origin
+    r = git('remote')
+    if r.returncode == 0:
+        state['has_origin'] = 'origin' in r.stdout.split()
+
+    return state
+
+def get_remote_branch_sha(web_root, branch):
+    """
+    Return the SHA at origin/<branch> WITHOUT fetching.
+    Uses ls-remote — a single lightweight network call.
+    Returns None if branch doesn't exist on origin.
+    """
+    r = subprocess.run(
+        ['git', '-C', web_root, 'ls-remote', 'origin', f'refs/heads/{branch}'],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return None, r.stderr.strip()
+    for line in r.stdout.splitlines():
+        parts = line.split('\t')
+        if len(parts) == 2 and parts[1] == f'refs/heads/{branch}':
+            return parts[0], None
+    return None, None
+
+def list_remote_branches(web_root, pattern=None):
+    """Return list of (branch_name, sha) for origin. Optional pattern filter."""
+    r = subprocess.run(
+        ['git', '-C', web_root, 'ls-remote', '--heads', 'origin'],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        parts = line.split('\t')
+        if len(parts) != 2:
+            continue
+        sha, ref = parts
+        name = ref.replace('refs/heads/', '')
+        if pattern and pattern not in name:
+            continue
+        out.append((name, sha))
+    return out
 
 def update_moodle_code(server_name, branch=None, verbose=False):
+    """
+    Update Moodle code from git.
+
+    Decision tree:
+      1. Inspect repo state (branch, HEAD, shallow, dirty, origin)
+      2. Ask origin (ls-remote) what the target branch's tip is
+      3. If HEAD == tip       -> report "already up to date", DO NOTHING
+      4. If HEAD is ahead     -> report, DO NOTHING
+      5. If dirty             -> warn and ask before overwriting tracked files
+      6. Update:
+           shallow: fetch --depth 1 + reset --hard ONLY if SHA changed
+           full:    pull --ff-only; on failure, ask before falling back to reset
+      7. Verify and report
+
+    Untracked files (config.php, moodledata, local plugins) are preserved
+    by git itself in all paths.
+    """
+    web_root = get_moodle_root(server_name)
+    if not os.path.isdir(os.path.join(web_root, '.git')):
+        print_error(f"{web_root} is not a git repository.")
+        sys.exit(1)
+
+    state = get_repo_state(web_root)
+
+    if not state['has_origin']:
+        print_error(f"No 'origin' remote configured in {web_root}.")
+        sys.exit(1)
+
+    # ---- Determine target branch ----
+    target_branch = branch or state['branch']
+    if not target_branch:
+        ver_branch, _ = get_moodle_version(server_name)
+        if ver_branch:
+            # version.php has $branch = '5.2' → MOODLE_502_STABLE
+            guess = f"MOODLE_{ver_branch.replace('.', '')}_STABLE"
+            print_warning(f"Detached HEAD and no branch hint; guessing '{guess}' from version.php.")
+            target_branch = guess
+        else:
+            print_error("Cannot determine target branch. Pass --branch explicitly.")
+            sys.exit(1)
+
+    # ---- Report current state ----
+    print_info(f"Repository state for {server_name}:")
+    print(f"  Web root : {web_root}")
+    print(f"  Branch   : {state['branch'] or '(detached)'}")
+    print(f"  HEAD     : {state['head_short'] or '?'}")
+    print(f"  Clone    : {'shallow' if state['shallow'] else 'full'}")
+    print(f"  Dirty    : {'yes' if state['dirty'] else 'no'}")
+    print(f"  Target   : origin/{target_branch}")
+
+    # ---- Query remote tip WITHOUT fetching ----
+    remote_sha, err = get_remote_branch_sha(web_root, target_branch)
+    if err:
+        print_error(f"Failed to query origin: {err}")
+        sys.exit(1)
+    if not remote_sha:
+        print_error(f"Branch '{target_branch}' not found on origin.")
+        branches = list_remote_branches(web_root, pattern='MOODLE_')
+        if branches:
+            print("Available Moodle branches on origin:")
+            for name, _ in branches[-10:]:
+                print(f"  {name}")
+        sys.exit(1)
+
+    remote_short = remote_sha[:7]
+    target_ref = f"origin/{target_branch}"
+
+    # ---- Already up to date? ----
+    if state['head_sha'] == remote_sha:
+        print_success(
+            f"{server_name} already up to date at {remote_short} ({target_ref})."
+        )
+        return False
+
+    # ---- Local ahead of remote? ----
+    if state['branch'] == target_branch and state['head_sha']:
+        r = subprocess.run(
+            ['git', '-C', web_root, 'rev-list', '--count',
+             f'{state["head_sha"]}..{remote_sha}'],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0 and r.stdout.strip() == '0':
+            print_info(
+                f"Local HEAD ({state['head_short']}) is already ahead of "
+                f"{target_ref} ({remote_short}). Nothing to update."
+            )
+            return False
+
+    print_info(f"Update available: {state['head_short'] or '(none)'} -> {remote_short}")
+
+    # ---- Dirty check ----
+    if state['dirty']:
+        print_warning("Tracked files have local modifications:")
+        r = subprocess.run(
+            ['git', '-C', web_root, 'status', '--porcelain',
+             '--untracked-files=no'],
+            capture_output=True, text=True,
+        )
+        for line in r.stdout.splitlines()[:15]:
+            print(f"    {line}")
+        if len(r.stdout.splitlines()) > 15:
+            print(f"    ... and {len(r.stdout.splitlines()) - 15} more")
+        if not print_prompt(
+            "These will be discarded. Continue? (y/N): "
+        ).strip().lower().startswith('y'):
+            print_warning("Update aborted by user.")
+            sys.exit(0)
+
+    # ---- Perform update ----
+    if state['shallow']:
+        print_info("Shallow clone — depth-1 fetch into FETCH_HEAD.")
+        run_cmd(
+            ['git', '-C', web_root, 'fetch', '--depth', '1',
+             'origin', f'refs/heads/{target_branch}'],
+            verbose,
+        )
+
+        # Check FETCH_HEAD — if it matches HEAD, no reset needed
+        r = subprocess.run(
+            ['git', '-C', web_root, 'rev-parse', 'FETCH_HEAD'],
+            capture_output=True, text=True,
+        )
+        fetched_sha = r.stdout.strip() if r.returncode == 0 else None
+        if fetched_sha == state['head_sha']:
+            print_success(
+                f"No new commit after fetch — {server_name} still at "
+                f"{state['head_short']}."
+            )
+            return False
+        if fetched_sha != remote_sha:
+            print_warning(
+                f"FETCH_HEAD ({fetched_sha[:7] if fetched_sha else '?'}) "
+                f"differs from ls-remote tip ({remote_short}) — possible race. "
+                f"Using FETCH_HEAD."
+            )
+        print_info(f"Resetting to {fetched_sha[:7]}.")
+        run_cmd(['git', '-C', web_root, 'reset', '--hard', fetched_sha], verbose)
+
+    else:
+        print_info(f"Full clone — fast-forward pull from {target_ref}.")
+        r = subprocess.run(
+            ['git', '-C', web_root, 'pull', '--ff-only', 'origin', target_branch],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            if verbose and r.stdout:
+                print(r.stdout)
+        else:
+            # Pull failed — do NOT silently reset. Ask first.
+            errline = (r.stderr or '').strip().splitlines()
+            print_warning(
+                "Fast-forward pull failed"
+                + (f": {errline[-1]}" if errline else ".")
+            )
+            print_info(
+                "Typical causes: local commits diverged, or a previous shallow "
+                "reset left history unreconcilable."
+            )
+            if not print_prompt(
+                f"Fetch and reset --hard to {target_ref}? This discards "
+                f"local commits. (y/N): "
+            ).strip().lower().startswith('y'):
+                print_warning("Update aborted.")
+                sys.exit(1)
+            run_cmd(['git', '-C', web_root, 'fetch', 'origin', target_branch], verbose)
+            run_cmd(['git', '-C', web_root, 'reset', '--hard', target_ref], verbose)
+
+    # ---- Verify ----
+    after = get_repo_state(web_root)
+    if after['head_sha'] == state['head_sha']:
+        print_success(f"No change — {server_name} still at {state['head_short']}.")
+        return False
+
+    print_success(
+        f"Updated {server_name}: "
+        f"{state['head_short']} -> {after['head_short']} ({target_ref})."
+    )
+    return True
     """
     Update Moodle code from git.
 
@@ -930,10 +1200,37 @@ def update_moodle(server_name, branch=None, enable_maintenance=True, verbose=Fal
         # 2. Database upgrade (only needed when code actually changed)
         if changed:
             print_info("Running Moodle database upgrade...")
-            rc = upgrade_moodle(server_name, check_only=False, verbose=verbose)
-            if rc != 0:
-                print_error(f"Moodle upgrade returned exit code {rc}. "
-                            "Check the logs – maintenance mode will still be disabled.")
+            upgrade_failed = False
+            try:
+                result = run_moodle_cli(server_name, 'upgrade.php',
+                                        ['--non-interactive'], verbose)
+                if result.returncode != 0:
+                    upgrade_failed = True
+                    print_error(
+                        f"Moodle upgrade returned exit code {result.returncode}."
+                    )
+                    # Show everything Moodle said — this is what we were throwing away
+                    if getattr(result, 'stdout', None):
+                        print(f"{COLOR_DIM}--- upgrade.php stdout ---{COLOR_RESET}")
+                        print(result.stdout)
+                    if getattr(result, 'stderr', None):
+                        print(f"{COLOR_DIM}--- upgrade.php stderr ---{COLOR_RESET}")
+                        print_error(result.stderr)
+                    print_warning(
+                        "Maintenance mode will still be disabled. "
+                        "Check the output above, fix the cause, then run option 5 "
+                        "(Upgrade DB only) to retry."
+                    )
+            except SystemExit:
+                raise
+            except Exception as e:
+                upgrade_failed = True
+                print_error(f"Upgrade raised an exception: {e}")
+
+            if upgrade_failed:
+                # Skip cache purge — half-upgraded sites can misbehave
+                print_warning("Skipping cache purge because upgrade failed.")
+                raise SystemExit(1) if False else None
         else:
             print_info("No code changes; skipping database upgrade.")
 
