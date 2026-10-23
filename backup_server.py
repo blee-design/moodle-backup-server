@@ -619,9 +619,6 @@ def handle_existing_database(db_name, auth_args, backup_dir, server_name, policy
 
 def get_table_prefix(server_name):
     cfg = load_server_config(server_name)
-    return cfg['table_prefix']
-    if not os.path.isfile(config_file):
-        return 'mdl_'  # fallback
     with open(config_file, 'r') as f:
         content = f.read()
     match = re.search(r"\$CFG->prefix\s*=\s*['\"]([^'\"]+)['\"]\s*;", content)
@@ -1083,83 +1080,6 @@ def update_moodle_code(server_name, branch=None, verbose=False):
         f"{state['head_short']} -> {after['head_short']} ({target_ref})."
     )
     return True
-    """
-    Update Moodle code from git.
-
-    - Shallow clone  -> depth-1 fetch + reset --hard FETCH_HEAD (stays shallow, tiny download)
-    - Full clone     -> git pull --ff-only
-    Untracked files (config.php, local/, plugins, moodledata) are preserved by git itself.
-    Modified *tracked* files will be lost – we warn about that.
-    """
-    web_root = get_moodle_root(server_name)
-    if not os.path.isdir(os.path.join(web_root, '.git')):
-        print_error(f"{web_root} is not a git repository.")
-        sys.exit(1)
-
-    current_branch = branch or get_current_branch(web_root)
-    if not current_branch:
-        print_warning(f"Could not determine current branch in {web_root}.")
-        current_branch = 'MOODLE_502_STABLE'
-        print_info(f"Falling back to branch: {current_branch}")
-
-    print_info(f"Updating {server_name} at {web_root} (branch: {current_branch})")
-
-    # Warn about modified tracked files that will be lost
-    status = subprocess.run(
-        ['git', '-C', web_root, 'status', '--porcelain'],
-        capture_output=True, text=True
-    ).stdout
-    modified = [l for l in status.splitlines() if l[:2].strip() and not l.startswith('??')]
-    if modified:
-        print_warning(f"{len(modified)} tracked file(s) have local modifications. "
-                      "These will be overwritten by the update:")
-        for line in modified[:10]:
-            print(f"    {line}")
-        if len(modified) > 10:
-            print(f"    ... and {len(modified) - 10} more")
-        if not print_prompt("Continue and discard these changes? (y/N): ").lower().startswith('y'):
-            print_warning("Update aborted by user.")
-            sys.exit(0)
-
-    # Record current HEAD
-    before = subprocess.run(
-        ['git', '-C', web_root, 'rev-parse', '--short', 'HEAD'],
-        capture_output=True, text=True
-    ).stdout.strip()
-
-    shallow = is_shallow_clone(web_root)
-
-    if shallow:
-        print_info("Shallow clone detected – using depth-1 fetch + reset (stays shallow).")
-        run_cmd(['git', '-C', web_root, 'fetch', '--depth', '1',
-                 'origin', current_branch], verbose)
-        run_cmd(['git', '-C', web_root, 'reset', '--hard', 'FETCH_HEAD'], verbose)
-    else:
-        print_info("Full clone detected – using fast-forward pull.")
-        result = subprocess.run(
-            ['git', '-C', web_root, 'pull', '--ff-only', 'origin', current_branch],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            print_warning(f"Fast-forward pull failed: {result.stderr.strip()}")
-            print_info("Falling back to depth-1 fetch + reset.")
-            run_cmd(['git', '-C', web_root, 'fetch', '--depth', '1',
-                     'origin', current_branch], verbose)
-            run_cmd(['git', '-C', web_root, 'reset', '--hard', 'FETCH_HEAD'], verbose)
-        elif verbose and result.stdout:
-            print(result.stdout)
-
-    after = subprocess.run(
-        ['git', '-C', web_root, 'rev-parse', '--short', 'HEAD'],
-        capture_output=True, text=True
-    ).stdout.strip()
-
-    if before == after:
-        print_success(f"No new changes – {server_name} already up to date ({after}).")
-        return False
-
-    print_success(f"Updated {server_name}: {before} -> {after}")
-    return True
 
 def upgrade_moodle(server_name, check_only=False, verbose=False):
     """
@@ -1228,9 +1148,9 @@ def update_moodle(server_name, branch=None, enable_maintenance=True, verbose=Fal
                 print_error(f"Upgrade raised an exception: {e}")
 
             if upgrade_failed:
-                # Skip cache purge — half-upgraded sites can misbehave
-                print_warning("Skipping cache purge because upgrade failed.")
-                raise SystemExit(1) if False else None
+                print_error(f"Update of {server_name} completed with upgrade errors. See above.")
+                raise SystemExit(1)
+            print_success(f"Update of {server_name} complete.")
         else:
             print_info("No code changes; skipping database upgrade.")
 
@@ -1261,26 +1181,6 @@ def setup_cron(server_name, schedule='* * * * *', user='www-data', verbose=False
     cron_line = f"{schedule} {user} {' '.join(cmd)}"
     # Use crontab -u root -l to check and add
     # We'll implement a helper to manage crontab entries.
-
-def setup_cron_job(server_name, schedule='* * * * *', verbose=False):
-    """Add a cron job for the given server to root's crontab."""
-    cron_cmd = f"{PHP_BIN} {os.path.join(get_moodle_root(server_name), 'admin', 'cli', 'cron.php')}"
-    cron_line = f"{schedule} root {cron_cmd} > /dev/null 2>&1"
-    # Get current crontab
-    crontab = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
-    if crontab.returncode == 0 and cron_cmd in crontab.stdout:
-        print_info("Cron job already exists; updating.")
-    # Remove any existing line for this server to avoid duplicates
-    lines = crontab.stdout.splitlines() if crontab.returncode == 0 else []
-    filtered = [line for line in lines if cron_cmd not in line]
-    filtered.append(cron_line)
-    final = '\n'.join(filtered) + '\n'
-    proc = subprocess.run(['crontab', '-'], input=final, text=True)
-    if proc.returncode == 0:
-        print_success(f"Cron job installed with schedule: {schedule}")
-    else:
-        print_error("Failed to install cron job.")
-    return proc.returncode
 
 def show_status(server_name, verbose=False):
     branch, release = get_moodle_version(server_name)
@@ -1452,7 +1352,8 @@ def create_archive(source_dir, archive_path, verbose=False):
     start = time.time()
 
     if verbose:
-        cmd = ['tar', '-C', source_dir, '-cJvf', archive_path, '.']
+        cmd = ['tar', '-C', source_dir, '-cvf', archive_path,
+               '-I', 'xz -T0 -6', '.']
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
@@ -1470,7 +1371,8 @@ def create_archive(source_dir, archive_path, verbose=False):
             print_error("tar exited with an error during compression.")
             sys.exit(1)
     else:
-        cmd = ['tar', '-C', source_dir, '-cJf', archive_path, '.']
+        cmd = ['tar', '-C', source_dir, '-cf', archive_path,
+               '-I', 'xz -T0 -6', '.']
         stop = spinner(f"Compressing {total_members} entries ({_human_size(raw_bytes)})")
         try:
             subprocess.run(cmd, check=True, capture_output=True)
@@ -1546,7 +1448,6 @@ def extract_archive(archive_path, target_dir, verbose=False):
         f"Extraction complete: {landed} files restored into {target_dir} "
         f"in {_human_time(elapsed)}"
     )
-
 # ----------------------------------------------------------------------
 # Backup
 # ----------------------------------------------------------------------
@@ -1656,6 +1557,45 @@ def backup(backup_location, verbose):
                     print_info("Data directory archived.")
             else:
                 print_warning(f"Data dir {data_src} not found, skipping.")
+
+        # Build manifest (inside the archive, so restore can preview contents)
+        manifest = {
+            "version": 2,
+            "created": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "tool_version": "2.1.0",
+            "compression": "xz",
+            "total_raw_bytes": 0,
+            "total_files": 0,
+            "servers": {},
+        }
+        for server_name in SERVERS:
+            sd = os.path.join(temp_dir, server_name)
+            if not os.path.isdir(sd):
+                continue
+            sbytes, sfiles, _ = _scan_tree(sd)
+            components = {}
+            for comp in ('html', 'data', 'db.sql',
+                         f'config-{server_name}.php'):
+                path = os.path.join(sd, comp)
+                if os.path.exists(path):
+                    if os.path.isdir(path):
+                        b, f, _ = _scan_tree(path)
+                    else:
+                        b, f = os.path.getsize(path), 1
+                    components[comp] = {"bytes": b, "files": f}
+            server_cfg = load_server_config(server_name)
+            manifest["servers"][server_name] = {
+                **{k: server_cfg.get(k)
+                   for k in ('config_file', 'web_root', 'data_dir',
+                             'db_name', 'backup_web_root',
+                             'clone_web_root_from')},
+                "components": components,
+            }
+            manifest["total_raw_bytes"] += sbytes
+            manifest["total_files"] += sfiles
+
+        with open(os.path.join(temp_dir, 'MANIFEST.json'), 'w') as f:
+            json.dump(manifest, f, indent=2)
 
         # Create archive
         if backup_location:
@@ -1931,6 +1871,23 @@ def restore(restore_location, verbose):
 
     try:
         extract_archive(restore_location, temp_dir, verbose)
+
+        manifest = None
+        try:
+            with open(os.path.join(temp_dir, 'MANIFEST.json')) as f:
+                manifest = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            print_warning("No MANIFEST.json in archive — using legacy restore path.")
+        if manifest:
+            print_info(
+                f"Archive created {manifest['created']} — "
+                f"{manifest['total_files']} files, "
+                f"{_human_size(manifest['total_raw_bytes'])} raw"
+            )
+            for sname, sc in manifest["servers"].items():
+                comps = ", ".join(f"{k} ({_human_size(v['bytes'])})"
+                                  for k, v in sc["components"].items())
+                print(f"  {sname}: {comps}")
 
         ensure_server_access()
         policy = get_conflict_policy(verbose)
@@ -2317,16 +2274,6 @@ def restore_previous(backup_dir, verbose):
             os.unlink(temp_auth_file)
             if verbose:
                 print_verbose(f"Removed temporary database auth file: {temp_auth_file}")
-
-def print_summary(operation, start_time, servers, file_counts, db_sizes):
-    elapsed = time.time() - start_time
-    print(f"\n{COLOR_BOLD}{COLOR_CYAN}═══ {operation.upper()} SUMMARY ═══{COLOR_RESET}")
-    for server in servers:
-        print(f"  {COLOR_BOLD}{server}{COLOR_RESET}")
-        print(f"    Web files: {file_counts[server]['web']}")
-        print(f"    Data files: {file_counts[server]['data']}")
-        print(f"    DB size: {db_sizes[server]}")
-    print(f"{COLOR_DIM}Total time: {elapsed:.2f}s{COLOR_RESET}")
 
 # ----------------------------------------------------------------------
 # Main CLI
