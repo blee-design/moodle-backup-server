@@ -2059,6 +2059,95 @@ def _choose_server():
         print_error("Invalid choice.")
         return None
 
+# ----------------------------------------------------------------------
+# PHP setup helpers
+# ----------------------------------------------------------------------
+MOODLE_PHP_EXTENSIONS = [
+    'iconv', 'mbstring', 'curl', 'openssl', 'tokenizer', 'soap',
+    'ctype', 'zip', 'zlib', 'gd', 'simplexml', 'spl', 'pcre',
+    'intl', 'json', 'xml', 'xmlrpc', 'mysqli', 'sodium', 'opcache',
+]
+
+# Package names per OS family
+PHP_PACKAGE_MAP = {
+    'debian': {
+        'base': ['php', 'php-cli', 'php-common'],
+        'ext': {
+            'iconv': 'php-iconv', 'mbstring': 'php-mbstring',
+            'curl': 'php-curl', 'openssl': 'php-openssl',
+            'tokenizer': 'php-tokenizer', 'soap': 'php-soap',
+            'ctype': 'php-ctype', 'zip': 'php-zip', 'zlib': 'php-zlib',
+            'gd': 'php-gd', 'simplexml': 'php-xml', 'spl': 'php-common',
+            'pcre': 'php-common', 'intl': 'php-intl', 'json': 'php-json',
+            'xml': 'php-xml', 'xmlrpc': 'php-xmlrpc',
+            'mysqli': 'php-mysql', 'sodium': 'php-sodium',
+            'opcache': 'php-opcache',
+        },
+    },
+    'rhel': {
+        'base': ['php', 'php-cli', 'php-common'],
+        'ext': {
+            'iconv': 'php-common', 'mbstring': 'php-mbstring',
+            'curl': 'php-curl', 'openssl': 'php-openssl',
+            'tokenizer': 'php-common', 'soap': 'php-soap',
+            'ctype': 'php-common', 'zip': 'php-zip', 'zlib': 'php-common',
+            'gd': 'php-gd', 'simplexml': 'php-xml', 'spl': 'php-common',
+            'pcre': 'php-common', 'intl': 'php-intl', 'json': 'php-json',
+            'xml': 'php-xml', 'xmlrpc': 'php-xmlrpc',
+            'mysqli': 'php-mysqlnd', 'sodium': 'php-sodium',
+            'opcache': 'php-opcache',
+        },
+    },
+}
+
+def detect_os_family():
+    """Return 'debian', 'rhel', or None."""
+    if os.path.isfile('/etc/os-release'):
+        with open('/etc/os-release') as f:
+            content = f.read().lower()
+        if any(x in content for x in ('debian', 'ubuntu', 'linuxmint', 'kali')):
+            return 'debian'
+        if any(x in content for x in ('rhel', 'fedora', 'centos', 'rocky', 'alma')):
+            return 'rhel'
+    return None
+
+def detect_chroot():
+    """Return (is_chroot, detail_string)."""
+    try:
+        root_of_pid1 = os.readlink('/proc/1/root')
+        if os.path.realpath(root_of_pid1) != os.path.realpath('/'):
+            return True, f'/proc/1/root → {root_of_pid1} (not /)'
+    except OSError:
+        pass
+    if os.environ.get('debian_chroot'):
+        return True, f'debian_chroot={os.environ["debian_chroot"]}'
+    return False, ''
+
+def _php_version_installed():
+    """Return the installed PHP major.minor, or None."""
+    try:
+        r = subprocess.run(['php', '-r', 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;'],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+def _php_modules():
+    """Return set of enabled PHP module names (lower-case)."""
+    try:
+        r = subprocess.run(['php', '-m'], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return {m.strip().lower() for m in r.stdout.splitlines() if m.strip()}
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return set()
+
+def _missing_php_extensions():
+    mods = _php_modules()
+    return [e for e in MOODLE_PHP_EXTENSIONS if e.lower() not in mods]
+
 def _menu_backup():
     _clear()
     print(f"{COLOR_BOLD}== BACKUP =={COLOR_RESET}")
@@ -2291,6 +2380,106 @@ def _menu_config():
             save_config(DEFAULT_CONFIG)
             print_success(f"Created {get_config_path()}")
 
+def _menu_php_setup():
+    _clear()
+    print(f"{COLOR_BOLD}== PHP SETUP FOR MOODLE =={COLOR_RESET}")
+
+    # --- detect environment ---
+    family = detect_os_family()
+    if not family:
+        print_error("Unsupported OS: could not detect Debian/Ubuntu or RHEL/Fedora family from /etc/os-release.")
+        return
+
+    is_chroot, chroot_detail = detect_chroot()
+    print_info(f"OS family detected: {family}")
+    if is_chroot:
+        print_warning(f"Chroot environment detected ({chroot_detail}).")
+        print("  Package manager may need host-mounted /proc, /sys, /dev.")
+        print("  If apt/dnf fails, run this from the host, not inside the chroot.")
+
+    current = _php_version_installed()
+    if current:
+        print_info(f"PHP already installed: {current}")
+    else:
+        print_info("PHP not found — will install from the OS repository.")
+
+    # --- build package plan ---
+    pkg_map = PHP_PACKAGE_MAP[family]
+    pkg_list = list(pkg_map['base'])
+    missing_exts = _missing_php_extensions()
+    for ext in missing_exts:
+        p = pkg_map['ext'].get(ext)
+        if p and p not in pkg_list:
+            pkg_list.append(p)
+
+    print()
+    print(f"{COLOR_BOLD}Plan:{COLOR_RESET}")
+    print(f"  Package manager : {'apt' if family == 'debian' else 'dnf'}")
+    print(f"  Packages        : {', '.join(pkg_list) if pkg_list else '(nothing to install)'}")
+    print(f"  Missing PHP exts: {', '.join(missing_exts) if missing_exts else '(none)'}")
+    print()
+
+    if not pkg_list and not missing_exts:
+        print_success("PHP and all Moodle extensions are already installed.")
+        return
+
+    if print_prompt("Proceed with installation? (Y/n): ").strip().lower() in ('n', 'no'):
+        print_warning("Aborted.")
+        return
+
+    # --- install ---
+    if family == 'debian':
+        run_cmd(['apt', 'update'], verbose=True)
+        run_cmd(['apt', 'install', '-y'] + pkg_list, verbose=True)
+    else:  # rhel
+        run_cmd(['dnf', 'install', '-y'] + pkg_list, verbose=True)
+
+    # --- enable extensions (Debian) ---
+    if family == 'debian' and shutil.which('phpenmod'):
+        print_info("Enabling PHP extensions with phpenmod...")
+        for ext in missing_exts:
+            # phpenmod expects module name without php- prefix
+            mod = ext  # iconv, mbstring, curl, ...
+            # Some Debian packages use different module names
+            aliases = {
+                'mysqli': 'mysqli', 'simplexml': 'simplexml',
+                'xml': 'xml', 'xmlrpc': 'xmlrpc', 'json': 'json',
+                'sodium': 'sodium', 'opcache': 'opcache',
+            }
+            mod = aliases.get(ext, ext)
+            try:
+                run_cmd(['phpenmod', mod], verbose=True, check=False)
+            except Exception:
+                pass
+        print_success("phpenmod finished (some modules may already have been enabled).")
+
+    # --- restart PHP / web server ---
+    restarted = False
+    for svc in ('apache2', 'php*-fpm', 'php-fpm'):
+        try:
+            r = subprocess.run(['systemctl', 'list-units', '--type=service', '--all',
+                                '--no-pager', '--no-legend', svc],
+                               capture_output=True, text=True, timeout=5)
+            if r.stdout.strip():
+                subprocess.run(['systemctl', 'restart', svc], timeout=15)
+                print_info(f"Restarted: {svc}")
+                restarted = True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+    if not restarted:
+        print_warning("No Apache / PHP-FPM service found — restart your web server manually.")
+
+    # --- verify ---
+    print()
+    print_info("Verifying installed PHP extensions...")
+    still_missing = _missing_php_extensions()
+    if still_missing:
+        print_warning(f"Still missing: {', '.join(still_missing)}")
+        print("  On Debian, run: phpenmod <module>  and restart PHP-FPM/Apache.")
+        print("  On RHEL, check:  dnf module list php  (AppStream may lack sodium on some versions.)")
+    else:
+        print_success("All Moodle PHP extensions are enabled. ✅")
+
 def run_menu():
     _clear()
     print(f"{COLOR_BOLD}{COLOR_MAGENTA} MOODLE NINJA – MAIN MENU {COLOR_RESET}")
@@ -2305,6 +2494,7 @@ def run_menu():
         print(f"  {COLOR_CYAN}7{COLOR_RESET}. Cron")
         print(f"  {COLOR_CYAN}8{COLOR_RESET}. Status")
         print(f"  {COLOR_CYAN}9{COLOR_RESET}. Config management")
+        print(f"  {COLOR_CYAN}10{COLOR_RESET}. PHP setup for Moodle")
         print(f"  {COLOR_CYAN}0{COLOR_RESET}. Exit")
         c = print_prompt("Choice: ").strip()
         try:
@@ -2319,6 +2509,7 @@ def run_menu():
             elif c == "7": _menu_cron()
             elif c == "8": _menu_status()
             elif c == "9": _menu_config()
+            elif c == "10": _menu_php_setup()
             elif c in ("0", "q", "quit", "exit"):
                 print_success("Bye.")
                 return
