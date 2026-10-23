@@ -17,12 +17,12 @@ if os.path.isfile(readme_path):
 setup(
     name='moodle_backup_server',
     version='1.0.0',
-    description='Backup and restore system for Moodle exam and nrb servers',
+    description='Backup, restore, and manage Moodle servers — config-driven, menu-based, credential-free',
     long_description=long_description,
     long_description_content_type='text/markdown',
     author='Udaya Raj Joshi',
     author_email='udayarajjoshi@aol.com',
-    url='https://github.com/udayarajjoshi/moodle-backup',  # Adjust as needed
+    url='https://github.com/blee-design/moodle-backup-server',
     py_modules=['backup_server'],          # Module name (without .py)
     entry_points={
         'console_scripts': [
