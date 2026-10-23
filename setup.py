@@ -16,7 +16,7 @@ if os.path.isfile(readme_path):
 
 setup(
     name='moodle_backup_server',
-    version='2.2.0',  # keep whatever `make version` reports
+    version='3.0.12',  # keep whatever `make version` reports
     description='Config-driven backup, restore, and upgrade tool for Moodle servers',
     long_description=long_description,
     long_description_content_type='text/markdown',
