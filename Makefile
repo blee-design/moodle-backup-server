@@ -238,6 +238,12 @@ format: ## Format source (ruff format or black)
 test: syntax ## Run tests (pytest if installed, else syntax only)
 	@if $(PYTHON) -c "import pytest" 2>/dev/null; then \
 		$(PYTHON) -m pytest -v; \
+		rc=$$?; \
+		if [ $$rc -eq 5 ]; then \
+			printf "$(C_YELLOW)⚠$(C_RESET) no tests collected (pytest exit 5) — treating as pass\n"; \
+		elif [ $$rc -ne 0 ]; then \
+			exit $$rc; \
+		fi; \
 	else \
 		printf "$(C_YELLOW)⚠$(C_RESET) pytest not installed — syntax only\n"; \
 	fi
@@ -247,7 +253,8 @@ test: syntax ## Run tests (pytest if installed, else syntax only)
 # ─────────────────────────────────────────────────────────────────────
 .PHONY: build
 build: clean-dist ## Build sdist + wheel into dist/
-	$(call say,Building distributions for v$(VERSION))
+	@ver=$$(sed -n "s/.*version='\([^']*\)'.*/\1/p" setup.py | head -1); \
+	printf "$(C_CYAN)▶$(C_RESET) Building distributions for v%s\n" "$$ver"
 	@$(PIP) install $(PIP_FLAGS) $(PIP_QUIET) build
 	@$(PYTHON) -m build
 	$(call ok,Built:)
@@ -265,20 +272,58 @@ clean: clean-dist ## Remove caches, .pyc, build artifacts
 	$(call ok,Cleaned)
 
 .PHONY: version
-version: ## Print current version
-	@echo $(VERSION)
+version: ## Print current version (read from setup.py at run time)
+	@sed -n "s/.*version='\([^']*\)'.*/\1/p" setup.py | head -1
+
+.PHONY: bump-version
+bump-version: ## Prompt to change version in setup.py (Enter = keep current)
+	@current=$$(sed -n "s/.*version='\([^']*\)'.*/\1/p" setup.py | head -1); \
+	if [ -z "$$current" ]; then \
+		printf "$(C_RED)✘$(C_RESET) Could not read version from setup.py\n" >&2; exit 1; \
+	fi; \
+	\
+	if [ -n "$(NEW_VERSION)" ]; then \
+		new="$(NEW_VERSION)"; \
+		printf "$(C_CYAN)▶$(C_RESET) Using NEW_VERSION from command line: %s\n" "$$new"; \
+	else \
+		read -p "New version [$$current]: " new; \
+		new=$${new:-$$current}; \
+	fi; \
+	\
+	if [ "$$new" = "$$current" ]; then \
+		printf "$(C_GREEN)✔$(C_RESET) Keeping version %s\n" "$$current"; \
+		exit 0; \
+	fi; \
+	\
+	if ! echo "$$new" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		printf "$(C_RED)✘$(C_RESET) Invalid version '%s' — expected X.Y.Z\n" "$$new" >&2; exit 1; \
+	fi; \
+	\
+	if git rev-parse "v$$new" >/dev/null 2>&1; then \
+		printf "$(C_RED)✘$(C_RESET) Tag v%s already exists — pick a higher version\n" "$$new" >&2; exit 1; \
+	fi; \
+	\
+	sed -i "s/version='[^']*'/version='$$new'/" setup.py; \
+	git add setup.py; \
+	git commit -q -m "chore: bump version to $$new"; \
+	printf "$(C_GREEN)✔$(C_RESET) Bumped %s → %s (commit created)\n" "$$current" "$$new"
 
 .PHONY: tag
-tag: ## Create annotated git tag vX.Y.Z
-	@if git rev-parse "v$(VERSION)" >/dev/null 2>&1; then \
-		printf "$(C_RED)✘$(C_RESET) tag v%s already exists\n" "$(VERSION)" >&2; exit 1; \
-	fi
-	@git tag -a "v$(VERSION)" -m "Release v$(VERSION)"
-	$(call ok,Created tag v$(VERSION) — push with: git push --tags)
+tag: ## Create annotated git tag vX.Y.Z (reads version from setup.py)
+	@ver=$$(sed -n "s/.*version='\([^']*\)'.*/\1/p" setup.py | head -1); \
+	if [ -z "$$ver" ]; then \
+		printf "$(C_RED)✘$(C_RESET) Could not read version from setup.py\n" >&2; exit 1; \
+	fi; \
+	if git rev-parse "v$$ver" >/dev/null 2>&1; then \
+		printf "$(C_RED)✘$(C_RESET) tag v%s already exists\n" "$$ver" >&2; exit 1; \
+	fi; \
+	git tag -a "v$$ver" -m "Release v$$ver"; \
+	printf "$(C_GREEN)✔$(C_RESET) Created tag v%s — push with: git push --tags\n" "$$ver"
 
 .PHONY: release
-release: test build tag ## Test → build → tag (does NOT push)
-	$(call ok,Release v$(VERSION) ready — push with: git push --tags)
+release: test bump-version build tag ## Test → bump version → build → tag (does NOT push)
+	@ver=$$(sed -n "s/.*version='\([^']*\)'.*/\1/p" setup.py | head -1); \
+	printf "$(C_GREEN)✔$(C_RESET) Release v%s ready — push with: git push && git push --tags\n" "$$ver"
 
 # ─────────────────────────────────────────────────────────────────────
 # Run without going through the console script
