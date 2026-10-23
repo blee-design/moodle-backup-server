@@ -383,10 +383,14 @@ def print_info(msg):
 def print_success(msg):
     print(f"{MATRIX_GREEN}✔ {msg}{RESET}")
 
-def print_warning(msg, file=sys.stderr):
+def print_warning(msg, file=None):
+    if file is None:
+        file = sys.stderr
     print(f"{BRIGHT_YELLOW}⚠ {msg}{RESET}", file=file)
 
-def print_error(msg, file=sys.stderr):
+def print_error(msg, file=None):
+    if file is None:
+        file = sys.stderr
     print(f"{BRIGHT_RED}✘ {msg}{RESET}", file=file)
 
 def print_prompt(msg):
@@ -1181,6 +1185,33 @@ def setup_cron(server_name, schedule='* * * * *', user='www-data', verbose=False
     cron_line = f"{schedule} {user} {' '.join(cmd)}"
     # Use crontab -u root -l to check and add
     # We'll implement a helper to manage crontab entries.
+
+def setup_cron_job(server_name, schedule='* * * * *', verbose=False):
+    """Add or update a cron job for the given server in root's crontab.
+
+    Removes any prior line for the same cron.php before appending, so
+    re-running with a different schedule is safe (no duplicates)."""
+    cron_cmd = (
+        f"{PHP_BIN} "
+        f"{os.path.join(get_moodle_root(server_name), 'admin', 'cli', 'cron.php')}"
+    )
+    cron_line = f"{schedule} root {cron_cmd} > /dev/null 2>&1"
+
+    crontab = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+    if crontab.returncode == 0 and cron_cmd in crontab.stdout:
+        print_info("Cron job already exists; updating.")
+
+    lines = crontab.stdout.splitlines() if crontab.returncode == 0 else []
+    filtered = [line for line in lines if cron_cmd not in line]
+    filtered.append(cron_line)
+    final = '\n'.join(filtered) + '\n'
+
+    proc = subprocess.run(['crontab', '-'], input=final, text=True)
+    if proc.returncode == 0:
+        print_success(f"Cron job installed with schedule: {schedule}")
+    else:
+        print_error("Failed to install cron job.")
+    return proc.returncode
 
 def show_status(server_name, verbose=False):
     branch, release = get_moodle_version(server_name)
