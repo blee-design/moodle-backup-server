@@ -322,9 +322,69 @@ tag: ## Create annotated git tag vX.Y.Z (reads version from setup.py)
 	printf "$(C_GREEN)✔$(C_RESET) Created tag v%s — push with: git push --tags\n" "$$ver"
 
 .PHONY: release
-release: test bump-version build tag ## Test → bump version → build → tag (does NOT push)
+release: test bump-version build tag ## Interactive: test → prompt version → build → tag → optional PyPI upload
 	@ver=$$(sed -n "s/.*version='\([^']*\)'.*/\1/p" setup.py | head -1); \
-	printf "$(C_GREEN)✔$(C_RESET) Release v%s ready — push with: git push && git push --tags\n" "$$ver"
+	\
+	printf "\n$(C_BOLD)$(C_CYAN)═══ Release v%s ready ═══$(C_RESET)\n\n" "$$ver"; \
+	printf "$(C_BOLD)Built artifacts:$(C_RESET)\n"; \
+	ls -lh dist/ 2>/dev/null | tail -n +2 | awk '{ printf "  %s  %s\n", $$5, $$9 }'; \
+	printf "\n$(C_BOLD)Push to git:$(C_RESET)\n"; \
+	printf "  git push\n"; \
+	printf "  git push --tags\n\n"; \
+	\
+	if ! command -v twine >/dev/null 2>&1; then \
+		printf "$(C_YELLOW)⚠$(C_RESET) twine not installed — PyPI upload unavailable.\n"; \
+		printf "  Install: pip install twine\n"; \
+		printf "  Then:    make upload\n"; \
+		exit 0; \
+	fi; \
+	\
+	read -p "Upload v$$ver to PyPI now? (y/N): " upload; \
+	case "$$upload" in \
+		y|Y|yes|YES) \
+			printf "\n$(C_CYAN)▶$(C_RESET) Validating dist/ with twine check...\n"; \
+			if ! twine check dist/*; then \
+				printf "$(C_RED)✘$(C_RESET) twine check failed — fix before uploading\n" >&2; \
+				exit 1; \
+			fi; \
+			printf "\n$(C_CYAN)▶$(C_RESET) Uploading to PyPI...\n"; \
+			printf "$(C_DIM)  Username: __token__\n  Password: <your PyPI API token>$(C_RESET)\n\n"; \
+			if twine upload dist/*; then \
+				printf "\n$(C_GREEN)✔$(C_RESET) Released v%s to PyPI!\n" "$$ver"; \
+				printf "  pip install --upgrade %s\n" "$(PKG_NAME)"; \
+			else \
+				printf "\n$(C_RED)✘$(C_RESET) Upload failed — retry with: twine upload dist/*\n" >&2; \
+				exit 1; \
+			fi; \
+			;; \
+		*) \
+			printf "\n$(C_DIM)Upload skipped — when ready: make upload$(C_RESET)\n"; \
+			;; \
+	esac
+
+
+.PHONY: upload
+upload: check-dist ## Upload current dist/ to PyPI (requires twine; no rebuild)
+	@if [ ! -d dist ] || [ -z "$$(ls -A dist 2>/dev/null)" ]; then \
+		printf "$(C_RED)✘$(C_RESET) dist/ is empty — run 'make build' first\n" >&2; \
+		exit 1; \
+	fi
+	@ver=$$(sed -n "s/.*version='\([^']*\)'.*/\1/p" setup.py | head -1); \
+	printf "$(C_CYAN)▶$(C_RESET) Uploading v%s to PyPI\n" "$$ver"; \
+	printf "$(C_DIM)  Username: __token__\n  Password: <your PyPI API token>$(C_RESET)\n\n"; \
+	twine upload dist/*
+
+.PHONY: check-dist
+check-dist: ## Validate dist/ packages with twine check
+	@if ! command -v twine >/dev/null 2>&1; then \
+		printf "$(C_RED)✘$(C_RESET) twine not installed — pip install twine\n" >&2; \
+		exit 1; \
+	fi
+	@if [ ! -d dist ] || [ -z "$$(ls -A dist 2>/dev/null)" ]; then \
+		printf "$(C_RED)✘$(C_RESET) dist/ is empty — run 'make build' first\n" >&2; \
+		exit 1; \
+	fi
+	@twine check dist/*
 
 # ─────────────────────────────────────────────────────────────────────
 # Run without going through the console script
