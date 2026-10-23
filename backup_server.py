@@ -2135,11 +2135,27 @@ def _php_version_installed():
     return None
 
 def _php_modules():
-    """Return set of enabled PHP module names (lower-case)."""
+    """
+    Return set of enabled PHP extensions (lower-case). Uses PHP itself so it
+    catches Zend extensions (opcache, xdebug) which `php -m` lists with a
+    'Zend ' prefix — stripping it makes the name match Moodle's check names.
+    """
     try:
-        r = subprocess.run(['php', '-m'], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(
+            ['php', '-r',
+             'foreach (array_merge(get_loaded_extensions(), '
+             'get_loaded_extensions(true)) as $e) echo strtolower($e), "\n";'],
+            capture_output=True, text=True, timeout=10,
+        )
         if r.returncode == 0:
-            return {m.strip().lower() for m in r.stdout.splitlines() if m.strip()}
+            mods = set()
+            for line in r.stdout.splitlines():
+                m = line.strip().lower()
+                if m.startswith('zend '):
+                    m = m[5:]          # 'zend opcache' -> 'opcache'
+                if m:
+                    mods.add(m)
+            return mods
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     return set()
@@ -2453,21 +2469,45 @@ def _menu_php_setup():
                 pass
         print_success("phpenmod finished (some modules may already have been enabled).")
 
-    # --- restart PHP / web server ---
-    restarted = False
-    for svc in ('apache2', 'php*-fpm', 'php-fpm'):
+    # --- restart PHP / web server (only if a service is actually active) ---
+    restarted = []
+    # Discover running php-fpm instances properly (glob is expanded by us, not systemctl)
+    candidate_svcs = ['apache2', 'httpd', 'nginx', 'php-fpm']
+    try:
+        r = subprocess.run(
+            ['systemctl', 'list-units', '--type=service', '--state=running',
+             '--no-pager', '--no-legend'],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if not parts:
+                    continue
+                name = parts[0]
+                # e.g. php8.2-fpm.service, php8.4-fpm.service
+                if 'php' in name and 'fpm' in name:
+                    candidate_svcs.append(name)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    for svc in candidate_svcs:
         try:
-            r = subprocess.run(['systemctl', 'list-units', '--type=service', '--all',
-                                '--no-pager', '--no-legend', svc],
-                               capture_output=True, text=True, timeout=5)
-            if r.stdout.strip():
-                subprocess.run(['systemctl', 'restart', svc], timeout=15)
+            r = subprocess.run(
+                ['systemctl', 'is-active', '--quiet', svc], timeout=5,
+            )
+            if r.returncode == 0:
+                subprocess.run(['systemctl', 'restart', svc], timeout=20)
                 print_info(f"Restarted: {svc}")
-                restarted = True
+                restarted.append(svc)
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
+
     if not restarted:
-        print_warning("No Apache / PHP-FPM service found — restart your web server manually.")
+        print_warning(
+            "No running Apache / Nginx / PHP-FPM service found. "
+            "If you plan to serve Moodle, install & start one, then re-run option 10."
+        )
 
     # --- verify ---
     print()
