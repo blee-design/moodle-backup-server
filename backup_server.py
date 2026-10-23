@@ -1341,85 +1341,14 @@ def backup(backup_location, verbose):
                     print_warning(f"Web root {web_src} not found, skipping.")
             else:
                 clone_src = server_cfg.get('clone_web_root_from')
+                msg = f"{server_name} web root omitted (will clone from '{clone_src}' on restore)."
                 if verbose:
-                    print_verbose(
-                        f"{server_name} web root omitted "
-                        f"(will clone from '{clone_src}' on restore)."
-                    )
+                    print_verbose(msg)
                 else:
-                    print_info(
-                        f"{server_name} web root omitted "
-                        f"(will clone from '{clone_src}' on restore)."
-                    )
+                    print_info(msg)
 
             # 4. Data directory — always captured (each server has its own)
             print_info(f"Copying data directory for {server_name}...")
-            data_src = server_cfg['data_dir']
-            data_dst = os.path.join(server_dir, 'data')
-            if os.path.exists(data_src):
-                run_cmd(['cp', '-a', '--reflink=auto', data_src, data_dst], verbose)
-                if verbose:
-                    print_verbose(f"Data directory copied: {data_src} -> {data_dst}")
-                else:
-                    print_info("Data directory archived.")
-            else:
-                print_warning(f"Data dir {data_src} not found, skipping.")
-
-            # Primary's config.php comes for free inside html/. Exam's web
-            # root is NOT backed up (it is cloned from primary on restore),
-            # so exam's own config.php must be captured explicitly — otherwise
-            # the clone would leave exam pointing at primary's DB/user/dataroot.
-            if server_name == SECONDARY_SERVER:
-                cfg_src = server_cfg['config_file']
-                cfg_dst = os.path.join(server_dir, f"config-{server_name}.php")
-                if os.path.exists(cfg_src):
-                    run_cmd(['cp', '-a', cfg_src, cfg_dst], verbose)
-                    if verbose:
-                        print_verbose(f"Exam config captured: {cfg_src} -> {cfg_dst}")
-                    else:
-                        print_info("Exam-specific config.php captured.")
-                else:
-                    print_warning(f"Exam config {cfg_src} not found — exam restore will not be able to recover DB settings.")
-            # Database dump – use server_cfg
-            print_info("Dumping database...")
-            db_dump = os.path.join(server_dir, 'db.sql')
-            current_auth = ensure_db_access(server_cfg['db_name'])
-            dump_cmd = [get_db_dump()] + current_auth + [f'--default-character-set={DB_CHARSET}', server_cfg['db_name']]
-
-            stop = spinner("Dumping database...")
-            try:
-                with open(db_dump, 'wb') as f:
-                    subprocess.run(dump_cmd, stdout=f, check=True)   # <-- fixed typo
-            finally:
-                stop()
-
-            if verbose:
-                print_verbose(f"Database '{server_cfg['db_name']}' dumped to {db_dump}")
-            else:
-                print_info("Database extracted.")
-
-            # Web root – skip for exam server
-            if server_name == SECONDARY_SERVER:
-                if verbose:
-                    print_verbose(f"Web root for {SECONDARY_SERVER} omitted (will be cloned during restore).")
-                else:
-                    print_info(f"Web root for {SECONDARY_SERVER} omitted (clone on restore).")
-            else:
-                print_verbose(random.choice(HACKER_PHRASES), component='web')
-                print_info("Copying web root...")
-                web_src = server_cfg['web_root']
-                web_dst = os.path.join(server_dir, 'html')
-                if os.path.exists(web_src):
-                    run_cmd(['cp', '-a', '--reflink=auto', web_src, web_dst], verbose)
-                    if verbose:
-                        print_verbose(f"Web root copied: {web_src} -> {web_dst}")
-                    else:
-                        print_info("Web root archived.")
-                else:
-                    print_warning(f"Web root {web_src} not found, skipping.")
-
-            # Data directory
-            print_info("Copying data directory...")
             data_src = server_cfg['data_dir']
             data_dst = os.path.join(server_dir, 'data')
             if os.path.exists(data_src):
@@ -1708,14 +1637,6 @@ def restore(restore_location, verbose):
 
         ensure_server_access()
         policy = get_conflict_policy(verbose)
-
-        # ========== PRIMARY SERVER RESTORE ==========
-        primary_info = SERVERS[PRIMARY_SERVER]                 # for symlink name/target
-        primary_cfg = load_server_config(PRIMARY_SERVER)       # full dynamic config
-        server_backup = os.path.join(temp_dir, PRIMARY_SERVER)
-        if not os.path.isdir(server_backup):
-            print_error(f"Primary server '{PRIMARY_SERVER}' backup not found.")
-            sys.exit(1)
 
         # ========== RESTORE (all servers, in dependency order) ==========
         restored_web_roots = {}
@@ -2157,14 +2078,21 @@ def _menu_backup():
             return
     elif c == "3":
         maintenance = True
+
+    srv_maint = None
     try:
         if maintenance:
-            set_maintenance(PRIMARY_SERVER, enable=True)
+            print_info("Which server should be put into maintenance mode?")
+            srv_maint = _choose_server()
+            if not srv_maint:
+                print_warning("No server selected — aborting.")
+                return
+            set_maintenance(srv_maint, enable=True, verbose=False)
         backup(loc, verbose=False)
     finally:
-        if maintenance:
+        if maintenance and srv_maint:
             try:
-                set_maintenance(PRIMARY_SERVER, enable=False)
+                set_maintenance(srv_maint, enable=False, verbose=False)
             except SystemExit:
                 print_warning("Could not disable maintenance mode — do it manually.")
 
