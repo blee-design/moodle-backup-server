@@ -16,7 +16,7 @@ if os.path.isfile(readme_path):
 
 setup(
     name='moodle_backup_server',
-    version='1.0.0',
+    version='2.1.0',
     description='Backup, restore, and manage Moodle servers — config-driven, menu-based, credential-free',
     long_description=long_description,
     long_description_content_type='text/markdown',
