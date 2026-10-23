@@ -236,7 +236,8 @@ format: ## Format source (ruff format or black)
 
 .PHONY: test
 test: syntax ## Run tests (pytest if installed, else syntax only)
-	@if $(PYTHON) -c "import pytest" 2>/dev/null; then \
+	@set +e; \
+	if $(PYTHON) -c "import pytest" 2>/dev/null; then \
 		$(PYTHON) -m pytest -v; \
 		rc=$$?; \
 		if [ $$rc -eq 5 ]; then \
